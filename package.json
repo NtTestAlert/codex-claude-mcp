@@ -4,6 +4,14 @@
   "description": "Local MCP bridge for Codex to delegate to Claude Code with isolated, resumable sessions.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NtTestAlert/codex-claude-mcp.git"
+  },
+  "homepage": "https://github.com/NtTestAlert/codex-claude-mcp#readme",
+  "bugs": { "url": "https://github.com/NtTestAlert/codex-claude-mcp/issues" },
+  "author": "NtTestAlert",
+  "keywords": ["mcp", "codex", "claude", "claude-code", "model-context-protocol", "ai", "code-review"],
   "bin": { "codex-claude-mcp": "dist/index.js" },
   "files": ["dist", "README.md", "LICENSE", "AGENTS.snippet.md", "scripts/login.ps1"],
   "engines": { "node": ">=20.3" },

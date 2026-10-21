@@ -2,7 +2,7 @@
 
 A local stdio MCP server that lets Codex ask Claude Code for an independent
 opinion or delegate a task, then follow up on the same Claude conversation.
-Adapted from `cc-codex-mcp` by NtTestAlert (MIT).
+Adapted from [cc-codex-mcp](https://github.com/NtTestAlert/cc-codex-mcp) by NtTestAlert (MIT).
 
 - `claude_ask`: start a session in a project directory.
 - `claude_followup`: resume an explicit bridge-owned session.
@@ -19,6 +19,8 @@ compatibility baseline is Claude Code 2.1.277. Use your existing Claude Code
 authentication method; the isolated configuration needs its own login.
 
 ```sh
+git clone https://github.com/NtTestAlert/codex-claude-mcp.git
+cd codex-claude-mcp
 npm install
 npm run build
 node dist/index.js --doctor
@@ -47,7 +49,7 @@ tool_timeout_sec = 3700
 ```
 
 Restart the Codex session after registration. See `AGENTS.snippet.md` for optional
-project instructions. This repository is local; no GitHub remote is required.
+project instructions.
 
 ## Tools
 
