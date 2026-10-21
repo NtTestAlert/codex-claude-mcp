@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { promises as fs, readFileSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -12,19 +11,20 @@ import { syncConfig } from './configSync.js';
 import { readSession, writeSession, type SessionInfo } from './sessions.js';
 import { runClaude } from './runner.js';
 import { withThreadLock } from './lock.js';
+import { checkAuth } from './auth.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const shutdown = new AbortController();
 const inflight = new Set<Promise<unknown>>();
 type Extra = { signal: AbortSignal; _meta?: { progressToken?: string | number }; sendNotification(n: any): Promise<void> };
-const permissions = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'] as const;
+const permissions = ['manual', 'default', 'acceptEdits', 'auto', 'plan', 'dontAsk', 'bypassPermissions'] as const;
 const common = {
   prompt: z.string().min(1).describe('Task or follow-up for Claude. Sent on stdin.'),
   model: z.string().min(1).optional().describe('Claude model alias or full model ID.'),
   effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
   timeout_sec: z.number().int().min(10).max(3600).default(900),
 };
-type Input = { prompt: string; model?: string; effort?: string; timeout_sec: number; cwd?: string; session_id?: string; permission_mode?: typeof permissions[number] };
+type Input = { prompt: string; model?: string; effort?: string; timeout_sec: number; cwd?: string; session_id?: string; permission_mode?: typeof permissions[number]; allowed_tools?: string[] };
 function result(out: Record<string, unknown>) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(out, null, 2) }], structuredContent: out, isError: Boolean(out.error) };
 }
@@ -44,14 +44,16 @@ async function invoke(input: Input, extra: Extra) {
       info = saved;
     } else {
       sessionId = randomUUID();
-      info = { session_id: sessionId, cwd: path.resolve(input.cwd!), permission_mode: input.permission_mode ?? 'default', created_at: new Date().toISOString(), model: input.model, effort: input.effort };
+      info = { session_id: sessionId, cwd: path.resolve(input.cwd!), permission_mode: input.permission_mode ?? 'manual', created_at: new Date().toISOString(), model: input.model, effort: input.effort, allowed_tools: input.allowed_tools };
     }
     if (!(await fs.stat(info.cwd).catch(() => undefined))?.isDirectory()) throw new Error(`Session working directory no longer exists: ${info.cwd}`);
     return await withThreadLock(home, sessionId, input.timeout_sec * 1000, async () => {
       // Re-read after taking the cross-process lock: an earlier follow-up may have updated model settings.
       if (input.session_id) info = (await readSession(home, sessionId!))!;
       if (!info) throw new Error('Session metadata disappeared while waiting for its lock.');
-      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-claude-mcp-'));
+      const runsDirectory = path.join(home, '.codex-claude-mcp', 'runs');
+      await fs.mkdir(runsDirectory, { recursive: true });
+      const dir = await fs.mkdtemp(path.join(runsDirectory, 'run-'));
       let keep = false;
       try {
         // Each subprocess gets its own immutable config snapshot, even across bridge processes.
@@ -62,6 +64,7 @@ async function invoke(input: Input, extra: Extra) {
         const effort = input.effort ?? info.effort;
         const args = ['-p', '--output-format', 'stream-json', '--verbose',
           '--permission-mode', info.permission_mode,
+          ...(info.allowed_tools?.length ? ['--allowedTools', ...info.allowed_tools] : []),
           '--strict-mcp-config', '--mcp-config', config.mcpConfigPath,
           '--settings', config.settingsPath,
           ...(input.session_id ? [`--resume=${sessionId}`] : [`--session-id=${sessionId}`]),
@@ -84,7 +87,9 @@ async function invoke(input: Input, extra: Extra) {
         return result({ session_id: sessionId, answer: run.answer, duration_sec: run.durationSec,
           warnings: [...config.warnings, ...run.warnings], activity: run.activity,
           ...(run.answerFile ? { answer_file: run.answerFile } : {}),
-          ...(run.error ? { error: `${run.error}${run.stderrTail ? `\n${run.stderrTail}` : ''}\nIf authentication failed, run: ${loginCommand(home)}` } : {}) });
+          ...(run.error ? { error: `${run.error}${run.stderrTail ? `\n${run.stderrTail}` : ''}${
+            /not logged in|invalid api.?key|authentication[_ ](?:failed|error)|oauth token.*(?:expired|invalid)|please run.*\/login/i.test(`${run.error}\n${run.stderrTail}`)
+              ? `\nAuthenticate this profile: ${loginCommand(home)}` : ''}` } : {}) });
       } finally {
         // Config can contain MCP credentials; never retain it with a long answer.
         await Promise.all(['settings.json', 'mcp.json'].map(name => fs.rm(path.join(dir, name), { force: true })));
@@ -107,7 +112,10 @@ function tracked(input: Input, extra: Extra) {
 }
 server.registerTool('claude_ask', {
   title: 'Ask Claude', description: 'Start an independent Claude Code session in a project. Claude can inspect the project and perform the requested task. Returns session_id for follow-ups. There is no enforced read-only sandbox.',
-  inputSchema: { ...common, cwd: z.string().min(1), permission_mode: z.enum(permissions).default('default').describe('Claude permission mode, fixed for this session. bypassPermissions explicitly skips Claude permission prompts.') },
+  inputSchema: { ...common, cwd: z.string().min(1),
+    permission_mode: z.enum(permissions).default('manual').describe('Claude permission mode, fixed for this session. default is a legacy alias for manual; auto uses Claude policy. bypassPermissions explicitly skips Claude permission prompts.'),
+    allowed_tools: z.array(z.string().min(1).regex(/^[A-Za-z][^\r\n\0]*$/)).max(100).optional().describe('Explicit Claude tool permission rules to pre-approve, preserved on follow-up. Example: ["Bash(git diff *)", "Bash(git status *)"]. These grant permissions, not a sandbox or tool visibility restriction.'),
+  },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 }, (input, extra) => tracked(input, extra as Extra));
 server.registerTool('claude_followup', {
@@ -117,11 +125,21 @@ server.registerTool('claude_followup', {
 }, (input, extra) => tracked(input, extra as Extra));
 
 async function main() {
+  if (process.argv.includes('--auth-status')) {
+    const home = await ensureHome();
+    const authentication = await checkAuth(resolveClaude(), home);
+    console.log(JSON.stringify({ home, authentication,
+      ...(authentication.status === 'authenticated' ? {} : { login: loginCommand(home) }) }, null, 2));
+    process.exitCode = authentication.status === 'authenticated' ? 0 : authentication.status === 'unauthenticated' ? 1 : 2;
+    return;
+  }
   if (process.argv.includes('--doctor')) {
     const home = await ensureHome();
     const config = await syncConfig(mainClaudeHome(), home);
-    console.log(JSON.stringify({ command: resolveClaude(), home, source_home: mainClaudeHome(), ...config,
-      login: loginCommand(home), authentication: 'Not checked; run Claude auth status in the isolated home.' }, null, 2));
+    const command = resolveClaude();
+    const authentication = await checkAuth(command, home);
+    console.log(JSON.stringify({ command, home, source_home: mainClaudeHome(), ...config,
+      login: loginCommand(home), authentication }, null, 2));
     return;
   }
   let stopping = false;

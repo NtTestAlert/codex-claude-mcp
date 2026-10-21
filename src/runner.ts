@@ -78,6 +78,35 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
   };
   const event = (ev: Json) => {
     lastEvent = str(ev.type) ?? 'unknown';
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      // Report only server identity and normalized status. Error payloads can
+      // contain command arguments, environment values, or authentication URLs.
+      const serverLabel = (value: unknown) => {
+        const name = str(value);
+        return name ? stripAnsi(name).replace(/[\r\n\t]/g, ' ').slice(0, 100) : '(unknown server)';
+      };
+      const startupError = (name?: unknown) => warn(`MCP server ${serverLabel(name)} startup failed`);
+      if (Array.isArray(ev.mcp_servers)) {
+        for (const server of ev.mcp_servers) {
+          if (!obj(server)) continue;
+          const status = (str(server.status) ?? '').toLowerCase().replace(/[_\s]+/g, '-');
+          const name = server.name ?? server.server_name;
+          if (['failed', 'error', 'errored'].includes(status)) startupError(name);
+          else if (['needs-auth', 'auth-required', 'authentication-required', 'unauthenticated'].includes(status)) {
+            warn(`MCP server ${serverLabel(name)} requires authentication`);
+          }
+        }
+      }
+      const errors = ev.mcp_server_errors;
+      if (Array.isArray(errors)) {
+        for (const entry of errors) startupError(obj(entry) ? entry.name ?? entry.server_name ?? entry.server : undefined);
+      } else if (obj(errors)) {
+        // Accept a single named error as well as a server-name -> error map.
+        const name = str(errors.name) ?? str(errors.server_name) ?? str(errors.server);
+        if (name) startupError(name);
+        else for (const name of Object.keys(errors)) startupError(name);
+      } else if (typeof errors === 'string' && errors.trim()) startupError();
+    }
     // Subagent events can have their own session IDs; only parent init/result owns ours.
     if ((ev.type === 'system' && ev.subtype === 'init') || ev.type === 'result') {
       const id = str(ev.session_id);
@@ -97,7 +126,7 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
           const id = str(block.id);
           if (id && tools.has(id)) continue;
           if (id) tools.add(id);
-          if (name === 'Bash') activity.commands++;
+          if (name === 'Bash' || name === 'PowerShell') activity.commands++;
           if (name.startsWith('mcp__')) activity.mcp_tool_calls.push(name);
           if (name === 'Agent' || name === 'Task') activity.subagent_events++;
           lastEvent = `tool:${name}`;

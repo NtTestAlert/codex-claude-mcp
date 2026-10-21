@@ -32,6 +32,39 @@ test('error result retains partial answer and permission diagnostics', async t =
   assert.equal(r.answer, 'partial');
   assert.deepEqual(r.warnings, ['Permission denied: Bash']);
 });
+test('reports init MCP failures and authentication requirements without leaking details', async t => {
+  const r = await run(t, [{ ...init, mcp_servers: [
+    { name: 'working', status: 'connected' },
+    { name: 'broken', status: 'failed', error: 'SECRET_TOKEN', config: { token: 'SECRET_TOKEN' } },
+    { name: 'login', status: 'needs-auth' },
+    { name: 'login2', status: 'auth_required' },
+  ], mcp_server_errors: [{ name: 'broken', error: 'SECRET_TOKEN' }, { server_name: 'other', error: 'SECRET_TOKEN' }, 'SECRET_TOKEN'] }, result()]);
+  assert.equal(r.error, undefined);
+  assert.deepEqual(r.warnings, [
+    'MCP server broken startup failed', 'MCP server login requires authentication',
+    'MCP server login2 requires authentication', 'MCP server other startup failed',
+    'MCP server (unknown server) startup failed',
+  ]);
+  assert.ok(!JSON.stringify(r).includes('SECRET_TOKEN'));
+});
+test('supports map and single-record MCP startup errors', async t => {
+  for (const errors of [
+    { search: { message: 'SECRET_TOKEN' }, storage: 'SECRET_TOKEN' },
+    { server: 'search', error: 'SECRET_TOKEN' },
+    'SECRET_TOKEN',
+  ]) {
+    const r = await run(t, [{ ...init, mcp_server_errors: errors }, result()]);
+    assert.ok(r.warnings.length > 0);
+    assert.ok(r.warnings.every(w => w.includes('startup failed')));
+    assert.ok(!JSON.stringify(r).includes('SECRET_TOKEN'));
+  }
+});
+test('counts PowerShell tool calls as commands', async t => {
+  const r = await run(t, [init, { type: 'assistant', message: { content: [
+    { type: 'tool_use', id: 'ps', name: 'PowerShell' }, { type: 'tool_use', id: 'sh', name: 'Bash' },
+  ] } }, result()]);
+  assert.equal(r.activity.commands, 2);
+});
 test('tracks tool calls once and ignores subagent answer text', async t => {
   const tool = { type: 'assistant', message: { content: [
     { type: 'tool_use', id: 'a', name: 'Bash' }, { type: 'tool_use', id: 'b', name: 'mcp__example__lookup' },

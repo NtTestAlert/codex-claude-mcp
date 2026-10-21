@@ -20,4 +20,10 @@ if (prompt === '__hang_until_cancelled__') {
   setInterval(() => {}, 1000);
   await new Promise(() => {});
 }
-console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, is_error: false, result: JSON.stringify(request) }));
+if (prompt === '__generic_failure__' || prompt === '__authentication_failure__') {
+  const error = prompt === '__authentication_failure__' ? 'Invalid API key' : 'Requested model is unavailable';
+  console.log(JSON.stringify({ type: 'result', subtype: 'error_during_execution', session_id: session, is_error: true, errors: [error] }));
+  process.exitCode = 1;
+} else {
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, is_error: false, result: JSON.stringify(request) }));
+}

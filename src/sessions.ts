@@ -8,6 +8,7 @@ export interface SessionInfo {
   permission_mode: string;
   model?: string;
   effort?: string;
+  allowed_tools?: string[];
   created_at: string;
 }
 
@@ -24,7 +25,9 @@ function validate(value: unknown, id: string): asserts value is SessionInfo {
       typeof s.permission_mode !== 'string' || !s.permission_mode ||
       typeof s.created_at !== 'string' || !Number.isFinite(Date.parse(s.created_at)) ||
       (s.model !== undefined && (typeof s.model !== 'string' || !s.model)) ||
-      (s.effort !== undefined && (typeof s.effort !== 'string' || !s.effort))) {
+      (s.effort !== undefined && (typeof s.effort !== 'string' || !s.effort)) ||
+      (s.allowed_tools !== undefined && (!Array.isArray(s.allowed_tools) || s.allowed_tools.length > 100 ||
+        s.allowed_tools.some(rule => typeof rule !== 'string' || !/^[A-Za-z][^\r\n\0]*$/.test(rule))))) {
     throw new Error(`Invalid bridge metadata for Claude session ${id}.`);
   }
 }

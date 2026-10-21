@@ -56,7 +56,15 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   const listed = await client.listTools();
   assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup']);
   const prompt = 'Review this\nwith "quotes", $variables, and Unicode: żółć. --model=not-an-option';
-  const ask = await call(client, 'claude_ask', { prompt, cwd: project, model: 'sonnet', effort: 'high', permission_mode: 'acceptEdits' });
+  const allowedTools = ['Read', 'Bash(git diff *)'];
+  const allowedArgs = ['--allowedTools', ...allowedTools];
+  function assertAllowedTools(args) {
+    const index = args.indexOf('--allowedTools');
+    assert.notEqual(index, -1);
+    assert.deepEqual(args.slice(index, index + allowedArgs.length), allowedArgs);
+    assert.equal(args.filter(arg => arg === '--allowedTools').length, 1);
+  }
+  const ask = await call(client, 'claude_ask', { prompt, cwd: project, model: 'sonnet', effort: 'high', permission_mode: 'acceptEdits', allowed_tools: allowedTools });
   assert.equal(ask.response.isError, false, ask.parsed.error);
   const id = ask.parsed.session_id;
   assert.match(id, /^[0-9a-f-]{36}$/);
@@ -71,6 +79,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.ok(first.args.includes('--model=sonnet'));
   assert.ok(first.args.includes('--effort=high'));
   assert.equal(first.args[first.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assertAllowedTools(first.args);
   assert.equal(first.args.some(arg => arg.includes('not-an-option')), false);
   assert.ok(first.args.includes('--strict-mcp-config'));
   for (const flag of ['--mcp-config', '--settings']) {
@@ -86,6 +95,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.ok(second.args.includes('--model=opus'));
   assert.ok(second.args.includes('--effort=low'));
   assert.equal(second.args[second.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assertAllowedTools(second.args);
 
   const unknown = await call(client, 'claude_followup', { prompt: 'Unknown', session_id: randomUUID() });
   assert.equal(unknown.response.isError, true);
@@ -104,7 +114,29 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.ok(third.args.includes('--model=opus'));
   assert.ok(third.args.includes('--effort=low'));
   assert.equal(third.args[third.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assertAllowedTools(third.args);
   assert.equal((await fs.readFile(log, 'utf8')).trim().split('\n').length, 3);
+
+  // The default and explicit modes reach Claude unchanged; omitted allow rules grant nothing implicitly.
+  for (const permissionMode of [undefined, 'manual', 'auto', 'default']) {
+    const modeAsk = await call(client, 'claude_ask', {
+      prompt: 'Check permission mode', cwd: project,
+      ...(permissionMode === undefined ? {} : { permission_mode: permissionMode }),
+    });
+    assert.equal(modeAsk.response.isError, false, modeAsk.parsed.error);
+    const invocation = JSON.parse(modeAsk.parsed.answer);
+    assert.equal(invocation.args[invocation.args.indexOf('--permission-mode') + 1], permissionMode ?? 'manual');
+    assert.equal(invocation.args.some(arg => /^--allowedTools(?:=|$)/.test(arg)), false);
+  }
+
+  const genericFailure = await call(client, 'claude_ask', { prompt: '__generic_failure__', cwd: project });
+  assert.equal(genericFailure.response.isError, true);
+  assert.match(genericFailure.parsed.error, /Requested model is unavailable/);
+  assert.doesNotMatch(genericFailure.parsed.error, /auth login|authentication failed/i);
+  const authenticationFailure = await call(client, 'claude_ask', { prompt: '__authentication_failure__', cwd: project });
+  assert.equal(authenticationFailure.response.isError, true);
+  assert.match(authenticationFailure.parsed.error, /Invalid API key/);
+  assert.match(authenticationFailure.parsed.error, /claude auth login/);
 });
 
 test('closing MCP stdin cancels an active Claude process and removes configuration snapshots', { timeout: 20000 }, async t => {
