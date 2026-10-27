@@ -27,6 +27,7 @@ export const cardHtml = String.raw`<!doctype html>
     button:focus-visible, summary:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
     .output { height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px; background: var(--color-background-secondary, ButtonFace); border-radius: 5px; }
     .details { margin-top: 10px; }
+    .cost { float: right; color: var(--color-text-secondary, GrayText); font-weight: 400; font-variant-numeric: tabular-nums; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 220px; font: 12px/1.5 ui-monospace, monospace; }
     [hidden] { display: none !important; }
   </style>
@@ -39,19 +40,25 @@ export const cardHtml = String.raw`<!doctype html>
     <button id="prompt-toggle" type="button" hidden>Show more</button>
     <div class="label">Output</div>
     <div id="output" class="output" tabindex="0" aria-label="Claude output">Waiting for Claude…</div>
-    <details id="details" class="details"><summary>Details</summary><pre id="json">Waiting for result…</pre></details>
+    <details id="details" class="details"><summary>Details <span id="cost" class="cost" hidden></span></summary><pre id="json">Waiting for result…</pre></details>
   </div>
   <script>
     (() => {
       const el = id => document.getElementById(id);
       const prompt = el('prompt'), promptToggle = el('prompt-toggle');
       const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
+      const cost = el('cost');
       const initId = 'claude-inspector-init';
       let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
       let polling = false, timer, pollRequest, requestSeq = 0, follow = true;
       let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
       const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
       const format = value => JSON.stringify(value, null, 2);
+      const showCost = result => {
+        const value = result?.total_cost_usd;
+        cost.hidden = typeof value !== 'number' || !Number.isFinite(value) || value < 0;
+        cost.textContent = cost.hidden ? '' : '$' + value.toFixed(3);
+      };
       const resize = () => {
         if (!ready) return;
         const width = Math.ceil(document.documentElement.clientWidth);
@@ -144,6 +151,7 @@ export const cardHtml = String.raw`<!doctype html>
               finished = true; stopPolling();
               const result = data.result ?? {};
               json.textContent = format({ input, result });
+              showCost(result);
               setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
               status.textContent = data.status === 'failed' ? 'Failed' : 'Complete';
               save(); resize(); return;
@@ -180,6 +188,7 @@ export const cardHtml = String.raw`<!doctype html>
             }
             finished = true; stopPolling();
             json.textContent = format({ input, result });
+            showCost(result);
             const failed = params.isError || result?.error;
             setOutput(typeof result?.answer === 'string' && result.answer ? result.answer : (result?.error || 'No output'), false);
             status.textContent = failed ? 'Failed' : 'Complete';

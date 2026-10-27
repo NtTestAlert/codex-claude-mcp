@@ -11,7 +11,7 @@ import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 function harness(host = {}) {
   const sent = [], listeners = new Map(), timers = new Map();
   let timerId = 0, disconnected = false;
-  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status'].map(id => {
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost'].map(id => {
     const handlers = new Map();
     return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
@@ -56,6 +56,7 @@ test('card displays prompt and output without an inner collapsed wrapper and ret
   assert.equal(h.elements.output.textContent, 'Hello');
   assert.equal(h.elements.status.textContent, 'Complete');
   assert.equal(JSON.parse(h.elements.json.textContent).result.duration_sec, 3);
+  assert.equal(h.elements.cost.hidden, true);
   h.receive({ id: 7, method: 'ui/resource-teardown' });
   assert.equal(h.sent.at(-1).id, 7);
   assert.equal(h.disconnected(), true);
@@ -106,6 +107,9 @@ test('immediate start result activates run-id polling and displays the final ans
   assert.equal(h.elements.output.textContent, 'final');
   assert.equal(h.elements.status.textContent, 'Complete');
   assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.0123);
+  assert.equal(h.elements.cost.textContent, '$0.012');
+  assert.equal(h.elements.cost.hidden, false);
+  assert.equal(h.elements.details.open, false);
   assert.equal(JSON.parse(h.elements.json.textContent).result.usage.output_tokens, 45);
   h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello', cwd: 'C:\\p' } } });
   h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
@@ -124,6 +128,17 @@ test('a recreated card retrieves the completed run and its details', () => {
   assert.equal(h.elements.prompt.textContent, 'hello');
   assert.equal(h.elements.output.textContent, 'complete');
   assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.25);
+  assert.equal(h.elements.cost.textContent, '$0.250');
+});
+
+test('card displays zero cost and hides invalid cost in a final result', () => {
+  for (const [value, expected] of [[0, '$0.000'], [0.0126, '$0.013'], [-1, ''], ['0.5', '']]) {
+    const h = harness();
+    h.initialize();
+    h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { answer: 'done', total_cost_usd: value } } });
+    assert.equal(h.elements.cost.textContent, expected);
+    assert.equal(h.elements.cost.hidden, expected === '');
+  }
 });
 
 test('card falls back when host lacks live calls or rejects polling, and errors stay open', () => {

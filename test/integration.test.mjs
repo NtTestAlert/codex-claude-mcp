@@ -26,7 +26,9 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
     await fs.rm(temp, { recursive: true, force: true });
   });
   async function connect() {
-    const client = new Client({ name: 'bridge-integration-test', version: '1.0.0' });
+    const client = new Client({ name: 'bridge-integration-test', version: '1.0.0' }, { capabilities: {
+      extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } },
+    } });
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [path.join(root, 'dist', 'index.js')],
@@ -87,7 +89,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.match(card.contents[0].text, /<div class="label">Output<\/div>/);
   const probe = await call(client, 'claude_ui_probe', { message: 'No Claude call needed' });
   assert.equal(probe.parsed.answer, 'No Claude call needed');
-  assert.equal(probe.parsed.client_ui_capability, null);
+  assert.deepEqual(probe.parsed.client_ui_capability.mimeTypes, ['text/html;profile=mcp-app']);
   assert.deepEqual(probe.response._meta.bridgeInput, { prompt: 'No Claude call needed' });
   await assert.rejects(fs.stat(log), { code: 'ENOENT' });
   const prompt = 'Review this\nwith "quotes", $variables, and Unicode: żółć. --model=not-an-option';
@@ -262,8 +264,10 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
   t.after(async () => { for (const client of clients) await client.close(); await fs.rm(temp, { recursive: true, force: true }); });
   await fs.mkdir(configDir, { recursive: true });
   await fs.mkdir(source);
-  const connect = async () => {
-    const client = new Client({ name: 'config-test', version: '1' });
+  const connect = async (ui = false) => {
+    const client = new Client({ name: 'config-test', version: '1' }, { capabilities: ui ? {
+      extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } },
+    } : {} });
     const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist', 'index.js')], cwd: root,
       env: { CLAUDE_BRIDGE_HOME: home, CLAUDE_BRIDGE_SOURCE_HOME: source, CLAUDE_CONFIG_DIR: source,
         CLAUDE_BRIDGE_CLAUDE_PATH: path.join(root, 'test', 'fixtures', 'integration-claude.mjs'),
@@ -273,7 +277,7 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
     return client;
   };
   await fs.writeFile(configPath, JSON.stringify({ ui_enabled: false }));
-  const disabled = await connect();
+  const disabled = await connect(true);
   assert.match(disabled.getInstructions(), /Use claude_ask.*claude_followup/);
   assert.doesNotMatch(disabled.getInstructions(), /claude_start|claude_wait/);
   let listed = await disabled.listTools();
@@ -298,6 +302,17 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
   assert.match(enabled.getInstructions(), /claude_start.*claude_wait/);
   assert.ok((await enabled.listTools()).tools.some(tool => tool.name === 'claude_start'));
   assert.ok((await enabled.listResources()).resources.some(resource => resource.uri === 'ui://claude/inspector.html'));
+  for (const setting of [undefined, 'auto', 'true', 'false']) {
+    await fs.writeFile(configPath, JSON.stringify(setting === undefined ? {} : { ui_enabled: setting }));
+    for (const ui of [false, true]) {
+      const current = await connect(ui);
+      const expected = setting === 'true' || (setting !== 'false' && ui);
+      const tools = (await current.listTools()).tools;
+      assert.equal(tools.some(tool => tool.name === 'claude_start'), expected, `setting=${setting}, ui=${ui}`);
+      assert.equal(/claude_start/.test(current.getInstructions()), expected);
+      await current.close();
+    }
+  }
 });
 
 test('invalid startup config fails clearly instead of silently enabling UI', async t => {
@@ -305,7 +320,7 @@ test('invalid startup config fails clearly instead of silently enabling UI', asy
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
   const configDir = path.join(temp, '.codex-claude-mcp');
   await fs.mkdir(configDir);
-  for (const contents of ['{', '{"ui_enabled":"false"}']) {
+  for (const contents of ['{', '{"ui_enabled":"sometimes"}', '{"ui_enabled":42}', '{"ui_enabled":null}']) {
     await fs.writeFile(path.join(configDir, 'config.json'), contents);
     const child = spawnSync(process.execPath, [path.join(root, 'dist', 'index.js')], {
       cwd: root, env: { ...process.env, CLAUDE_BRIDGE_HOME: temp }, encoding: 'utf8', timeout: 5000, windowsHide: true,
@@ -367,7 +382,7 @@ for (const toolName of ['claude_ask', 'claude_start']) test(`closing MCP stdin c
     await fs.rm(temp, { recursive: true, force: true });
   });
   const send = message => server.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
-  send({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'eof-test', version: '1' } } });
+  send({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } }, clientInfo: { name: 'eof-test', version: '1' } } });
   send({ method: 'notifications/initialized' });
   send({ id: 2, method: 'tools/call', params: { name: toolName, arguments: { prompt: '__hang_until_cancelled__', cwd: temp } } });
   const deadline = Date.now() + 8000;

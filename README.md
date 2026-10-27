@@ -194,11 +194,14 @@ interactive card and its tools, create it with:
 { "ui_enabled": false }
 ```
 
-`ui_enabled` defaults to `true` when the file or setting is absent. When false,
+`ui_enabled` defaults to `"auto"` when the file or setting is absent. In auto mode,
+the bridge enables the card only when the client advertises MCP Apps support for
+`text/html;profile=mcp-app` during initialization. Set `true` or `"true"` to
+force enablement, or `false` or `"false"` to disable it. When disabled,
 only `claude_ask`, `claude_followup`, and `claude_list_models` are exposed; the
 card resource and UI tools are not registered. The bridge reads this file once
 at startup, so reconnect or start a fresh session after changing it. Invalid JSON
-or a non-boolean `ui_enabled` prevents startup and reports an error.
+or an unsupported `ui_enabled` value prevents startup and reports an error.
 
 | Variable | Meaning |
 |---|---|

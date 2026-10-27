@@ -4,6 +4,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { resolveClaude } from './claudePath.js';
 import { ensureHome, mainClaudeHome, claudeHomePath, loginCommand } from './home.js';
@@ -17,24 +19,27 @@ import { startLiveRun, readLiveRun } from './liveRuns.js';
 import { discoverModels, modelGuidance, resolveModelShorthand, type ModelCatalog } from './models.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-async function readUiEnabled(): Promise<boolean> {
+async function readUiMode(): Promise<boolean | 'auto'> {
   const configPath = path.join(claudeHomePath(), '.codex-claude-mcp', 'config.json');
   let raw: string;
   try { raw = await fs.readFile(configPath, 'utf8'); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto';
     throw new Error(`Cannot read bridge config ${configPath}: ${(error as Error).message}`);
   }
   let config: unknown;
   try { config = JSON.parse(raw); }
   catch { throw new Error(`Invalid JSON in bridge config ${configPath}`); }
-  if (!config || typeof config !== 'object' || Array.isArray(config) ||
-      ('ui_enabled' in config && typeof config.ui_enabled !== 'boolean')) {
-    throw new Error(`Bridge config ${configPath} must be an object with a boolean ui_enabled setting`);
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error(`Bridge config ${configPath} must be an object`);
   }
-  return (config as { ui_enabled?: boolean }).ui_enabled ?? true;
+  const mode = 'ui_enabled' in config ? (config as { ui_enabled?: unknown }).ui_enabled : 'auto';
+  if (mode === true || mode === 'true') return true;
+  if (mode === false || mode === 'false') return false;
+  if (mode === 'auto') return 'auto';
+  throw new Error(`Bridge config ${configPath}: ui_enabled must be true, false, "true", "false", or "auto"`);
 }
-const uiEnabled = await readUiEnabled();
+const uiMode = await readUiMode();
 const shutdown = new AbortController();
 const inflight = new Set<Promise<unknown>>();
 type Extra = { signal: AbortSignal; requestId?: string | number; _meta?: { progressToken?: string | number }; sendNotification(n: any): Promise<void> };
@@ -146,6 +151,7 @@ const followShape = { ...common, model: modelParameter(), session_id: z.string()
 const startShape = { ...common, model: modelParameter(), cwd: z.string().min(1).optional(),
   session_id: z.string().uuid().optional(), permission_mode: z.enum(permissions).optional(),
   allowed_tools: askShape.allowed_tools };
+function createServer(uiEnabled: boolean) {
 const server = new McpServer({ name: 'codex-claude-mcp', version }, {
   instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
 });
@@ -277,6 +283,8 @@ server.registerTool('claude_list_models', {
   const current = refresh ? await refreshModels() : catalog;
   return { content: [{ type: 'text', text: JSON.stringify(current, null, 2) }], structuredContent: { ...current } };
 });
+return server;
+}
 
 async function main() {
   if (process.argv.includes('--auth-status')) {
@@ -296,6 +304,7 @@ async function main() {
       login: loginCommand(home), authentication }, null, 2));
     return;
   }
+  let server: McpServer | undefined;
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
@@ -304,7 +313,7 @@ async function main() {
     const timer = setTimeout(() => process.exit(1), 15000);
     timer.unref();
     await Promise.allSettled(inflight);
-    await server.close();
+    if (server) await server.close(); else await transport.close();
     clearTimeout(timer);
   };
   process.once('SIGINT', () => void stop());
@@ -312,8 +321,29 @@ async function main() {
   process.stdin.once('end', () => void stop());
   process.stdin.once('close', () => void stop());
   const transport = new StdioServerTransport();
-  await server.connect(transport);
-  const close = transport.onclose;
-  transport.onclose = () => { close?.(); void stop(); };
+  const pending: JSONRPCMessage[] = [];
+  const bridge: Transport = {
+    start: async () => {},
+    send: message => transport.send(message),
+    close: () => transport.close(),
+  };
+  let initializing = false;
+  transport.onclose = () => { bridge.onclose?.(); void stop(); };
+  transport.onerror = error => bridge.onerror?.(error);
+  transport.onmessage = message => {
+    if (server && !initializing) { bridge.onmessage?.(message); return; }
+    pending.push(message);
+    if (initializing || !('method' in message) || message.method !== 'initialize') return;
+    initializing = true;
+    const params = message.params as { capabilities?: { extensions?: Record<string, { mimeTypes?: unknown }> } } | undefined;
+    const mimeTypes = params?.capabilities?.extensions?.['io.modelcontextprotocol/ui']?.mimeTypes;
+    const supportsUi = Array.isArray(mimeTypes) && mimeTypes.includes('text/html;profile=mcp-app');
+    server = createServer(uiMode === 'auto' ? supportsUi : uiMode);
+    void server.connect(bridge).then(() => {
+      initializing = false;
+      for (const queued of pending.splice(0)) bridge.onmessage?.(queued);
+    }).catch(error => { console.error((error as Error).message); void stop(); });
+  };
+  await transport.start();
 }
 main().catch((e) => { console.error((e as Error).message); process.exitCode = 1; });
