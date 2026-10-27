@@ -1,15 +1,16 @@
 // A protocol-level substitute for Claude; deliberately never loads user configuration.
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
 if (args.includes('--input-format')) {
   const request = JSON.parse(prompt);
-  const response = process.env.INTEGRATION_MODELS_FAIL
+  const modelFixture = process.env.INTEGRATION_MODELS_FILE ? JSON.parse(readFileSync(process.env.INTEGRATION_MODELS_FILE, 'utf8')) : undefined;
+  const response = process.env.INTEGRATION_MODELS_FAIL || modelFixture?.fail
     ? { subtype: 'error', request_id: request.request_id, error: 'unavailable' }
     : { subtype: 'success', request_id: request.request_id,
-      response: { models: [{ value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-5-5', supportedEffortLevels: ['low', 'medium'] }] } };
+      response: { models: modelFixture?.models ?? [{ value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-5-5', supportedEffortLevels: ['low', 'medium'] }] } };
   console.log(JSON.stringify({ type: 'control_response', response }));
 } else {
 const value = flag => args.find(arg => arg.startsWith(`${flag}=`))?.slice(flag.length + 1)

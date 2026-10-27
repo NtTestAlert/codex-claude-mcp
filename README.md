@@ -62,16 +62,20 @@ The conversation tools accept `prompt`, optional `model`, optional `effort`
 Model/effort support is validated by Claude itself; values are not translated
 from Codex reasoning levels.
 
-At MCP startup, the bridge asks the resolved Claude Code executable for its model
+At MCP startup and periodically, the bridge asks the resolved Claude Code executable for its model
 catalogue using the isolated profile. This is an initialization request, not a
 model prompt. Discovered names, accepted values, and resolved model IDs appear in
-the MCP startup instructions, the tool descriptions, and `claude_list_models`. Call that tool with
+the MCP startup instructions, the tool descriptions, and `claude_list_models`. The
+startup instructions are a snapshot; use the current tool descriptions or
+`claude_list_models` for the latest catalogue. Call that tool with
 `{ "refresh": true }` to query again. The list reflects what Claude Code reports
 for that profile and provider; project settings, organization rules, or account
 availability can still prevent a particular request. The discovery process excludes
 project settings and disables hooks and MCP servers. If discovery times out or
-fails, the server starts normally, the tool reports `status: "unavailable"`, and
-explicit model aliases or provider IDs remain usable. No guessed model is chosen.
+fails before any successful discovery, the tool reports `status: "unavailable"`,
+and explicit model aliases or provider IDs remain usable. After a successful
+discovery, failures retain the last catalogue and `claude_list_models` reports
+`stale: true` and `refresh_warning` until discovery succeeds. No guessed model is chosen.
 
 For example, the Anthropic API model ID for Haiku 5.5 is `claude-haiku-5-5`;
 `haiku-5.5` is not that ID. The `haiku` alias may resolve differently on other
@@ -194,6 +198,14 @@ interactive card and its tools, create it with:
 { "ui_enabled": false }
 ```
 
+`model_refresh_sec` sets the background refresh interval in seconds (default
+3600, integer from 0 to 86400); `0` disables periodic refresh. Manual refresh
+remains available. Set it alongside `ui_enabled`, for example:
+
+```json
+{ "ui_enabled": "auto", "model_refresh_sec": 1800 }
+```
+
 `ui_enabled` defaults to `"auto"` when the file or setting is absent. In auto mode,
 the bridge enables the card only when the client advertises MCP Apps support for
 `text/html;profile=mcp-app` during initialization. Set `true` or `"true"` to
@@ -201,7 +213,7 @@ force enablement, or `false` or `"false"` to disable it. When disabled,
 only `claude_ask`, `claude_followup`, and `claude_list_models` are exposed; the
 card resource and UI tools are not registered. The bridge reads this file once
 at startup, so reconnect or start a fresh session after changing it. Invalid JSON
-or an unsupported `ui_enabled` value prevents startup and reports an error.
+or an unsupported setting value prevents startup and reports an error.
 
 | Variable | Meaning |
 |---|---|

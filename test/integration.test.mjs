@@ -320,7 +320,7 @@ test('invalid startup config fails clearly instead of silently enabling UI', asy
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
   const configDir = path.join(temp, '.codex-claude-mcp');
   await fs.mkdir(configDir);
-  for (const contents of ['{', '{"ui_enabled":"sometimes"}', '{"ui_enabled":42}', '{"ui_enabled":null}']) {
+  for (const contents of ['{', '{"ui_enabled":"sometimes"}', '{"ui_enabled":42}', '{"ui_enabled":null}', '{"model_refresh_sec":-1}', '{"model_refresh_sec":1.5}', '{"model_refresh_sec":"60"}']) {
     await fs.writeFile(path.join(configDir, 'config.json'), contents);
     const child = spawnSync(process.execPath, [path.join(root, 'dist', 'index.js')], {
       cwd: root, env: { ...process.env, CLAUDE_BRIDGE_HOME: temp }, encoding: 'utf8', timeout: 5000, windowsHide: true,
@@ -328,6 +328,57 @@ test('invalid startup config fails clearly instead of silently enabling UI', asy
     assert.notEqual(child.status, 0);
     assert.match(child.stderr, /bridge config/i);
   }
+});
+
+test('periodic discovery updates model guidance and retains a stale catalogue on failure', { timeout: 30000 }, async t => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-refresh-'));
+  const home = path.join(temp, 'isolated'), source = path.join(temp, 'primary');
+  const configDir = path.join(home, '.codex-claude-mcp'), models = path.join(temp, 'models.json');
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(configDir, 'config.json'), JSON.stringify({ model_refresh_sec: 1 }));
+  await fs.writeFile(models, JSON.stringify({ models: [{ value: 'old', displayName: 'Old', resolvedModel: 'claude-old' }] }));
+  const client = new Client({ name: 'refresh-test', version: '1' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist', 'index.js')], cwd: root,
+    env: { CLAUDE_BRIDGE_HOME: home, CLAUDE_BRIDGE_SOURCE_HOME: source, CLAUDE_CONFIG_DIR: source,
+      CLAUDE_BRIDGE_CLAUDE_PATH: path.join(root, 'test', 'fixtures', 'integration-claude.mjs'),
+      INTEGRATION_CALL_LOG: path.join(temp, 'calls.jsonl'), INTEGRATION_MODELS_FILE: models }, stderr: 'pipe' });
+  t.after(async () => { await client.close(); await fs.rm(temp, { recursive: true, force: true }); });
+  await client.connect(transport);
+  assert.match(client.getInstructions(), /catalogue at startup.*may change/i);
+  assert.match(client.getInstructions(), /claude-old/);
+  await fs.writeFile(models, JSON.stringify({ models: [{ value: 'new', displayName: 'New', resolvedModel: 'claude-new' }] }));
+  const deadline = Date.now() + 10000;
+  let listed;
+  while (Date.now() < deadline) {
+    listed = await client.listTools();
+    if (listed.tools.find(tool => tool.name === 'claude_ask').description.includes('claude-new')) break;
+    await delay(100);
+  }
+  assert.match(listed.tools.find(tool => tool.name === 'claude_ask').description, /claude-new/);
+  assert.match(listed.tools.find(tool => tool.name === 'claude_ask').inputSchema.properties.model.description, /claude-new/);
+  assert.match(client.getInstructions(), /claude-old/);
+  await fs.writeFile(models, JSON.stringify({ fail: true }));
+  let cached;
+  const failureDeadline = Date.now() + 10000;
+  while (Date.now() < failureDeadline) {
+    cached = await client.callTool({ name: 'claude_list_models', arguments: {} });
+    if (cached.structuredContent.stale) break;
+    await delay(100);
+  }
+  assert.equal(cached.structuredContent.stale, true);
+  assert.equal(cached.structuredContent.models[0].resolved_model, 'claude-new');
+  const failed = await client.callTool({ name: 'claude_list_models', arguments: { refresh: true } });
+  assert.equal(failed.structuredContent.status, 'available');
+  assert.equal(failed.structuredContent.models[0].resolved_model, 'claude-new');
+  assert.equal(failed.structuredContent.stale, true);
+  assert.ok(failed.structuredContent.refresh_warning);
+  cached = await client.callTool({ name: 'claude_list_models', arguments: {} });
+  assert.equal(cached.structuredContent.stale, true);
+  assert.match((await client.listTools()).tools.find(tool => tool.name === 'claude_ask').description, /claude-new/);
+  await fs.writeFile(models, JSON.stringify({ models: [{ value: 'new', displayName: 'New', resolvedModel: 'claude-new' }] }));
+  const recovered = await client.callTool({ name: 'claude_list_models', arguments: { refresh: true } });
+  assert.equal(recovered.structuredContent.stale, undefined);
 });
 
 test('failed startup model discovery leaves the MCP bridge usable', { timeout: 20000 }, async t => {

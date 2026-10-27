@@ -19,12 +19,12 @@ import { startLiveRun, readLiveRun } from './liveRuns.js';
 import { discoverModels, modelGuidance, resolveModelShorthand, type ModelCatalog } from './models.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-async function readUiMode(): Promise<boolean | 'auto'> {
+async function readBridgeConfig(): Promise<{ uiMode: boolean | 'auto'; modelRefreshSec: number }> {
   const configPath = path.join(claudeHomePath(), '.codex-claude-mcp', 'config.json');
   let raw: string;
   try { raw = await fs.readFile(configPath, 'utf8'); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto';
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { uiMode: 'auto', modelRefreshSec: 3600 };
     throw new Error(`Cannot read bridge config ${configPath}: ${(error as Error).message}`);
   }
   let config: unknown;
@@ -34,12 +34,18 @@ async function readUiMode(): Promise<boolean | 'auto'> {
     throw new Error(`Bridge config ${configPath} must be an object`);
   }
   const mode = 'ui_enabled' in config ? (config as { ui_enabled?: unknown }).ui_enabled : 'auto';
-  if (mode === true || mode === 'true') return true;
-  if (mode === false || mode === 'false') return false;
-  if (mode === 'auto') return 'auto';
-  throw new Error(`Bridge config ${configPath}: ui_enabled must be true, false, "true", "false", or "auto"`);
+  let uiMode: boolean | 'auto';
+  if (mode === true || mode === 'true') uiMode = true;
+  else if (mode === false || mode === 'false') uiMode = false;
+  else if (mode === 'auto') uiMode = 'auto';
+  else throw new Error(`Bridge config ${configPath}: ui_enabled must be true, false, "true", "false", or "auto"`);
+  const interval = 'model_refresh_sec' in config ? (config as { model_refresh_sec?: unknown }).model_refresh_sec : 3600;
+  if (typeof interval !== 'number' || !Number.isSafeInteger(interval) || interval < 0 || interval > 86400) {
+    throw new Error(`Bridge config ${configPath}: model_refresh_sec must be an integer from 0 to 86400`);
+  }
+  return { uiMode, modelRefreshSec: interval };
 }
-const uiMode = await readUiMode();
+const { uiMode, modelRefreshSec } = await readBridgeConfig();
 const shutdown = new AbortController();
 const inflight = new Set<Promise<unknown>>();
 type Extra = { signal: AbortSignal; requestId?: string | number; _meta?: { progressToken?: string | number }; sendNotification(n: any): Promise<void> };
@@ -153,7 +159,7 @@ const startShape = { ...common, model: modelParameter(), cwd: z.string().min(1).
   allowed_tools: askShape.allowed_tools };
 function createServer(uiEnabled: boolean) {
 const server = new McpServer({ name: 'codex-claude-mcp', version }, {
-  instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
+  instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} Model catalogue at startup (may change; use current tool descriptions or claude_list_models for the latest): ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
 });
 function tracked(input: Input, extra: Extra) {
   const live = uiEnabled ? startLiveRun(extra.requestId, { prompt: input.prompt, cwd: input.cwd, session_id: input.session_id }) : undefined;
@@ -259,10 +265,24 @@ server.registerTool('claude_run_status', {
 }
 
 let catalogRefresh: Promise<ModelCatalog> | undefined;
+let lastRefreshFailure: ModelCatalog | undefined;
+function currentCatalog() {
+  return lastRefreshFailure && catalog.status === 'available'
+    ? { ...catalog, stale: true, refresh_warning: lastRefreshFailure.warning ?? 'Model discovery failed.', refresh_checked_at: lastRefreshFailure.checked_at }
+    : catalog;
+}
 function refreshModels(): Promise<ModelCatalog> {
   if (catalogRefresh) return catalogRefresh;
   catalogRefresh = (async () => {
-    catalog = await readModelCatalog();
+    const next = await readModelCatalog();
+    if (next.status === 'unavailable' && catalog.status === 'available') {
+      lastRefreshFailure = next;
+      return currentCatalog();
+    }
+    lastRefreshFailure = next.status === 'unavailable' ? next : undefined;
+    const changed = next.status !== catalog.status || JSON.stringify(next.models) !== JSON.stringify(catalog.models) || next.warning !== catalog.warning;
+    catalog = next;
+    if (!changed) return catalog;
     const guidance = modelGuidance(catalog);
     askShape.model = modelParameter();
     followShape.model = modelParameter();
@@ -272,7 +292,10 @@ function refreshModels(): Promise<ModelCatalog> {
     startTool?.update({ description: `${startDescription} ${guidance}`, paramsSchema: startShape });
     return catalog;
   })().finally(() => { catalogRefresh = undefined; });
-  return catalogRefresh;
+  const pending = catalogRefresh;
+  inflight.add(pending);
+  void pending.then(() => inflight.delete(pending), () => inflight.delete(pending));
+  return pending;
 }
 server.registerTool('claude_list_models', {
   title: 'List Claude models',
@@ -280,10 +303,17 @@ server.registerTool('claude_list_models', {
   inputSchema: { refresh: z.boolean().default(false).describe('Refresh the model list from Claude Code before returning it.') },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, async ({ refresh }) => {
-  const current = refresh ? await refreshModels() : catalog;
+  const current = refresh ? await refreshModels() : currentCatalog();
   return { content: [{ type: 'text', text: JSON.stringify(current, null, 2) }], structuredContent: { ...current } };
 });
-return server;
+let refreshTimer: NodeJS.Timeout | undefined;
+let refreshStopped = false;
+const scheduleRefresh = () => {
+  if (refreshStopped || !modelRefreshSec) return;
+  refreshTimer = setTimeout(() => { void refreshModels().then(scheduleRefresh, scheduleRefresh); }, modelRefreshSec * 1000);
+  refreshTimer.unref();
+};
+return { server, startRefresh: scheduleRefresh, stopRefresh: () => { refreshStopped = true; clearTimeout(refreshTimer); } };
 }
 
 async function main() {
@@ -305,10 +335,12 @@ async function main() {
     return;
   }
   let server: McpServer | undefined;
+  let stopRefresh: (() => void) | undefined;
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    stopRefresh?.();
     shutdown.abort();
     const timer = setTimeout(() => process.exit(1), 15000);
     timer.unref();
@@ -338,10 +370,13 @@ async function main() {
     const params = message.params as { capabilities?: { extensions?: Record<string, { mimeTypes?: unknown }> } } | undefined;
     const mimeTypes = params?.capabilities?.extensions?.['io.modelcontextprotocol/ui']?.mimeTypes;
     const supportsUi = Array.isArray(mimeTypes) && mimeTypes.includes('text/html;profile=mcp-app');
-    server = createServer(uiMode === 'auto' ? supportsUi : uiMode);
+    const built = createServer(uiMode === 'auto' ? supportsUi : uiMode);
+    server = built.server;
+    stopRefresh = built.stopRefresh;
     void server.connect(bridge).then(() => {
       initializing = false;
       for (const queued of pending.splice(0)) bridge.onmessage?.(queued);
+      if (!stopping) built.startRefresh();
     }).catch(error => { console.error((error as Error).message); void stop(); });
   };
   await transport.start();
