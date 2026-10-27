@@ -1,144 +1,209 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { readLiveRun } from './liveRuns.js';
 
 export const CARD_URI = 'ui://claude/inspector.html';
 export const CARD_MIME = 'text/html;profile=mcp-app';
-export const cardMeta = {
-  ui: { resourceUri: CARD_URI },
-  // Compatibility alias for OpenAI hosts; the UI uses the standard MCP Apps bridge.
-  'openai/outputTemplate': CARD_URI,
-};
+export const cardMeta = { ui: { resourceUri: CARD_URI }, 'openai/outputTemplate': CARD_URI };
 
-// Self-contained so stdio users need no web server, build tool, or network access.
+// All assets are embedded for stdio connections; the host owns the outer tool row.
 export const cardHtml = String.raw`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Claude input and output</title>
+  <title>Claude</title>
   <style>
     :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 12px; color: var(--color-text-primary, CanvasText); background: var(--color-background-primary, Canvas); }
-    header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 8px; }
-    h1 { font-size: 14px; margin: 0; }
-    #status { color: var(--color-text-secondary, GrayText); font-size: 12px; }
-    details { border-top: 1px solid var(--color-border-primary, GrayText); padding: 8px 0; }
-    summary { cursor: pointer; font-weight: 600; border-radius: 3px; }
-    summary:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
-    pre { margin: 8px 0 0; padding: 8px; border-radius: 6px; background: var(--color-background-secondary, ButtonFace); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; }
+    body { margin: 0; padding: 8px 12px; color: var(--color-text-primary, CanvasText); background: var(--color-background-primary, Canvas); }
+    summary, button { cursor: pointer; }
+    summary { font-weight: 600; }
+    .state { color: var(--color-text-secondary, GrayText); font-weight: 400; font-size: 12px; margin-left: 8px; }
+    .label { font-weight: 600; margin: 10px 0 4px; }
+    .prompt { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5em; }
+    .prompt.clamped { max-height: 4.5em; overflow: hidden; }
+    button { background: none; border: 0; color: inherit; padding: 2px 0; text-decoration: underline; font: inherit; }
+    button:focus-visible, summary:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+    .output { height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px; background: var(--color-background-secondary, ButtonFace); border-radius: 5px; }
+    .details { margin-top: 10px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 220px; font: 12px/1.5 ui-monospace, monospace; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
-  <header><h1>Claude</h1><span id="status" role="status">Connecting to host…</span></header>
-  <details><summary>Input</summary><pre id="input">Waiting for tool input…</pre></details>
-  <details><summary>Output</summary><pre id="output">Waiting for Claude…</pre></details>
+  <div id="card">
+    <div class="state" id="status" role="status">Connecting…</div>
+    <div class="label">Prompt</div>
+    <div id="prompt" class="prompt clamped">Waiting for input…</div>
+    <button id="prompt-toggle" type="button" hidden>Show more</button>
+    <div class="label">Output</div>
+    <div id="output" class="output" tabindex="0" aria-label="Claude output">Waiting for Claude…</div>
+    <details id="details" class="details"><summary>Details</summary><pre id="json">Waiting for result…</pre></details>
+  </div>
   <script>
     (() => {
-      const status = document.getElementById('status');
-      const input = document.getElementById('input');
-      const output = document.getElementById('output');
+      const el = id => document.getElementById(id);
+      const prompt = el('prompt'), promptToggle = el('prompt-toggle');
+      const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
       const initId = 'claude-inspector-init';
-      let ready = false;
-      let finished = false;
-      let observer;
-      let lastSize = '';
-      const send = (message) => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
-      const format = (value) => JSON.stringify(value, null, 2);
+      let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
+      let polling = false, timer, pollRequest, requestSeq = 0, follow = true;
+      let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
+      const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
+      const format = value => JSON.stringify(value, null, 2);
       const resize = () => {
         if (!ready) return;
-        const height = Math.ceil(document.body.getBoundingClientRect().height);
         const width = Math.ceil(document.documentElement.clientWidth);
+        const height = Math.ceil(document.body.getBoundingClientRect().height);
         const size = width + ':' + height;
-        if (size === lastSize) return;
-        lastSize = size;
-        send({ method: 'ui/notifications/size-changed', params: { width, height } });
+        if (size !== lastSize) { lastSize = size; send({ method: 'ui/notifications/size-changed', params: { width, height } }); }
       };
-      const context = (value) => {
-        if (value?.theme === 'light' || value?.theme === 'dark') {
-          document.documentElement.style.colorScheme = value.theme;
+      const context = value => {
+        if (value?.theme === 'light' || value?.theme === 'dark') document.documentElement.style.colorScheme = value.theme;
+      };
+      const persist = () => {
+        try { window.openai?.setWidgetState?.({ detailsOpen: detail.open, promptExpanded, follow, scrollTop: restoredScrollTop ?? output.scrollTop }); } catch { /* optional host API */ }
+      };
+      const save = () => {
+        if (typeof window.openai?.setWidgetState !== 'function') return;
+        clearTimeout(widgetTimer); widgetTimer = setTimeout(persist, 250);
+      };
+      const restore = () => {
+        try {
+          const state = window.openai?.widgetState;
+          if (!state || typeof state !== 'object') return;
+          if (typeof state.detailsOpen === 'boolean') detail.open = state.detailsOpen;
+          if (state.promptExpanded === true) promptExpanded = true;
+          if (state.follow === false) follow = false;
+          if (typeof state.scrollTop === 'number' && state.scrollTop >= 0 && !follow) restoredScrollTop = state.scrollTop;
+        } catch { /* optional host API */ }
+      };
+      const showPrompt = value => {
+        prompt.textContent = typeof value === 'string' ? value : 'No prompt provided';
+        prompt.classList.toggle('clamped', !promptExpanded);
+        promptToggle.textContent = promptExpanded ? 'Show less' : 'Show more';
+        promptToggle.hidden = !promptExpanded && prompt.scrollHeight <= prompt.clientHeight + 1;
+      };
+      const setOutput = (text, append) => {
+        if (!haveOutput || !append) output.textContent = text;
+        else output.appendChild(document.createTextNode(text));
+        haveOutput = true;
+        if (follow) output.scrollTop = output.scrollHeight;
+        else if (restoredScrollTop !== undefined && (finished || output.scrollHeight - output.clientHeight >= restoredScrollTop)) {
+          output.scrollTop = restoredScrollTop; restoredScrollTop = undefined;
         }
       };
-      const handshakeTimeout = setTimeout(() => {
-        if (!ready) status.textContent = 'Host did not initialize the MCP Apps card';
-      }, 5000);
-      const receive = (event) => {
-        // Only the parent host/sandbox may provide tool data or lifecycle messages.
+      promptToggle.addEventListener('click', () => { promptExpanded = !promptExpanded; showPrompt(input?.prompt); save(); resize(); });
+      output.addEventListener('scroll', () => { follow = output.scrollHeight - output.scrollTop - output.clientHeight < 24; save(); });
+      detail.addEventListener('toggle', () => { save(); resize(); });
+      const stopPolling = () => { polling = false; clearTimeout(timer); pollRequest = undefined; };
+      const schedule = () => { if (polling && !finished) timer = setTimeout(poll, 700); };
+      const poll = () => {
+        if (!polling || finished || !input || (runId === undefined && callId === undefined)) return;
+        pollRequest = 'claude-live-' + (++requestSeq);
+        const args = runId !== undefined ? { run_id: runId, offset } : {
+          request_id: callId, prompt: input.prompt, ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+          ...(input.session_id === undefined ? {} : { session_id: input.session_id }), offset,
+        };
+        send({ id: pollRequest, method: 'tools/call', params: { name: runId !== undefined ? 'claude_run_status' : 'claude_ui_status', arguments: args } });
+        timer = setTimeout(() => { if (pollRequest) { stopPolling(); status.textContent = 'Running · live output unavailable'; } }, 5000);
+      };
+      const timeout = setTimeout(() => { if (!ready) status.textContent = 'Host did not initialize card'; }, 5000);
+      const receive = event => {
         if (event.source !== window.parent) return;
         const message = event.data;
         if (!message || message.jsonrpc !== '2.0') return;
         if (message.id === initId && !message.method) {
-          clearTimeout(handshakeTimeout);
-          if (message.error) {
-            status.textContent = 'Host rejected the MCP Apps card';
-            return;
-          }
-          if (ready || !message.result) return;
-          ready = true;
-          context(message.result.hostContext);
+          clearTimeout(timeout);
+          if (message.error || !message.result) { status.textContent = 'Host rejected card'; return; }
+          if (ready) return;
+          ready = true; context(message.result.hostContext); restore();
+          callId = message.result.hostContext?.toolInfo?.id;
+          canCallTools = Boolean(message.result.hostCapabilities?.serverTools);
+          polling = callId !== undefined && canCallTools;
           send({ method: 'ui/notifications/initialized', params: {} });
-          if (!finished) status.textContent = 'Waiting for tool input';
-          if (typeof ResizeObserver !== 'undefined') {
-            observer = new ResizeObserver(resize);
-            observer.observe(document.body);
-          }
-          resize();
-          return;
+          status.textContent = 'Waiting for input';
+          if (typeof ResizeObserver !== 'undefined') { observer = new ResizeObserver(() => { showPrompt(input?.prompt); resize(); }); observer.observe(document.body); }
+          resize(); return;
         }
         if (!ready) return;
+        if (pollRequest && message.id === pollRequest && !message.method) {
+          clearTimeout(timer); pollRequest = undefined;
+          if (finished) return;
+          const response = message.result;
+          let data = response?.structuredContent;
+          if (!data && response?.content?.[0]?.type === 'text') { try { data = JSON.parse(response.content[0].text); } catch {} }
+          if (message.error || response?.isError) { stopPolling(); status.textContent = 'Running · live output unavailable'; return; }
+          if (data?.available) {
+            missingPolls = 0;
+            if (typeof data.text === 'string' && data.text) setOutput(data.text, true);
+            if (Number.isSafeInteger(data.next_offset) && data.next_offset >= offset) offset = data.next_offset;
+            if (data.truncated) status.textContent = 'Running · live output truncated';
+            if (data.status === 'completed' || data.status === 'failed') {
+              finished = true; stopPolling();
+              const result = data.result ?? {};
+              json.textContent = format({ input, result });
+              setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
+              status.textContent = data.status === 'failed' ? 'Failed' : 'Complete';
+              save(); resize(); return;
+            }
+          } else if (++missingPolls >= 8) {
+            stopPolling(); status.textContent = 'Running · live output unavailable'; return;
+          }
+          schedule(); return;
+        }
         const params = message.params ?? {};
         switch (message.method) {
           case 'ui/notifications/tool-input-partial':
           case 'ui/notifications/tool-input':
-            input.textContent = format(params.arguments ?? {});
-            if (!finished) status.textContent = 'Running…';
+            input = params.arguments ?? {}; showPrompt(input.prompt);
+            if (!finished && runId === undefined) json.textContent = format({ input });
+            if (!finished) status.textContent = polling ? 'Running' : 'Running · live output unavailable';
+            if (message.method === 'ui/notifications/tool-input' && polling && !timer) schedule();
             break;
           case 'ui/notifications/tool-result': {
-            finished = true;
-            // Preserve the request when a host restores a card from just its result.
-            if (params._meta?.bridgeInput) input.textContent = format(params._meta.bridgeInput);
+            if (params._meta?.bridgeInput) { input = params._meta.bridgeInput; showPrompt(input.prompt); }
             let result = params.structuredContent;
             if (!result) {
               const text = (params.content ?? []).filter(item => item.type === 'text').map(item => item.text).join('\n');
               try { result = JSON.parse(text); } catch { result = { answer: text }; }
             }
-            output.textContent = format(result);
-            status.textContent = params.isError || result?.error ? 'Failed' : 'Complete';
-            break;
+            if (typeof result?.run_id === 'string' && result.status === 'working') {
+              if (finished || runId === result.run_id) break;
+              stopPolling(); runId = result.run_id; offset = 0;
+              json.textContent = format({ input, start: result });
+              polling = canCallTools;
+              status.textContent = polling ? 'Running' : 'Running · live output unavailable';
+              if (polling) schedule();
+              break;
+            }
+            finished = true; stopPolling();
+            json.textContent = format({ input, result });
+            const failed = params.isError || result?.error;
+            setOutput(typeof result?.answer === 'string' && result.answer ? result.answer : (result?.error || 'No output'), false);
+            status.textContent = failed ? 'Failed' : 'Complete';
+            save(); break;
           }
           case 'ui/notifications/tool-cancelled':
-            finished = true;
-            status.textContent = 'Cancelled';
-            output.textContent = params.reason ?? 'Tool call cancelled';
-            break;
-          case 'ui/notifications/host-context-changed':
-            context(params);
-            break;
-          case 'ping':
-            if (message.id !== undefined) send({ id: message.id, result: {} });
-            break;
+            finished = true; stopPolling(); status.textContent = 'Cancelled';
+            setOutput(params.reason ?? 'Tool call cancelled', false); break;
+          case 'ui/notifications/host-context-changed': context(params); break;
+          case 'ping': if (message.id !== undefined) send({ id: message.id, result: {} }); break;
           case 'ui/resource-teardown':
-            observer?.disconnect();
+            stopPolling(); clearTimeout(timeout); clearTimeout(widgetTimer); persist(); observer?.disconnect();
             window.removeEventListener('message', receive);
-            if (message.id !== undefined) send({ id: message.id, result: {} });
-            return;
+            if (message.id !== undefined) send({ id: message.id, result: {} }); return;
           default:
-            if (message.id !== undefined && message.method) {
-              send({ id: message.id, error: { code: -32601, message: 'Method not supported' } });
-            }
+            if (message.id !== undefined && message.method) send({ id: message.id, error: { code: -32601, message: 'Method not supported' } });
         }
         resize();
       };
       window.addEventListener('message', receive);
-      send({
-        id: initId,
-        method: 'ui/initialize',
-        params: {
-          protocolVersion: '2026-01-26',
-          appInfo: { name: 'Claude inspector', version: '1.0.0' },
-          appCapabilities: { availableDisplayModes: ['inline'] },
-        },
-      });
+      send({ id: initId, method: 'ui/initialize', params: {
+        protocolVersion: '2026-01-26', appInfo: { name: 'Claude inspector', version: '1.0.0' },
+        appCapabilities: { availableDisplayModes: ['inline'] },
+      } });
     })();
   </script>
 </body>
@@ -147,25 +212,30 @@ export const cardHtml = String.raw`<!doctype html>
 export function registerInlineCard(server: McpServer) {
   server.registerResource('claude-inspector', CARD_URI, {
     title: 'Claude input and output', mimeType: CARD_MIME,
-    description: 'Inline expandable input and output for Claude bridge calls.',
-  }, async () => ({
-    contents: [{ uri: CARD_URI, mimeType: CARD_MIME, text: cardHtml,
-      _meta: { ui: { prefersBorder: true, csp: { connectDomains: [], resourceDomains: [] } } } }],
-  }));
+    description: 'Inline Claude prompt, output, and expandable details.',
+  }, async () => ({ contents: [{ uri: CARD_URI, mimeType: CARD_MIME, text: cardHtml,
+    _meta: { ui: { prefersBorder: true, csp: { connectDomains: [], resourceDomains: [] } } } }] }));
+  server.registerTool('claude_ui_status', {
+    title: 'Read live Claude output',
+    description: 'Read the next live text chunk for the matching active tool call. Used by the Claude inline card.',
+    inputSchema: { request_id: z.union([z.string(), z.number()]), prompt: z.string(), cwd: z.string().optional(),
+      session_id: z.string().optional(), offset: z.number().int().min(0) },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    _meta: { ui: { visibility: ['app'] } },
+  }, async ({ request_id, prompt, cwd, session_id, offset }) => {
+    const data = readLiveRun(request_id, { prompt, cwd, session_id }, offset);
+    return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
+  });
   server.registerTool('claude_ui_probe', {
     title: 'Test Claude inline card',
-    description: 'Test inline expandable input/output rendering in this MCP host. Returns sample data without starting Claude, reading files, or making a model call. The client capability report does not prove that rendering occurred.',
+    description: 'Test inline Claude card rendering without starting Claude or making a model call.',
     inputSchema: { message: z.string().default('Inline card test') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: cardMeta,
-  }, async (input) => {
-    const capabilities = server.server.getClientCapabilities();
-    const data = {
-      answer: input.message,
-      client_ui_capability: capabilities?.extensions?.['io.modelcontextprotocol/ui'] ?? null,
-      note: 'Rendering succeeds only if an inline Claude card appears with expandable Input and Output sections.',
-    };
+  }, async input => {
+    const data = { answer: input.message, client_ui_capability: server.server.getClientCapabilities()?.extensions?.['io.modelcontextprotocol/ui'] ?? null,
+      note: 'Rendering succeeds only if the inline Claude card appears in the chat.' };
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data,
-      _meta: { bridgeInput: input } };
+      _meta: { bridgeInput: { prompt: input.message } } };
   });
 }

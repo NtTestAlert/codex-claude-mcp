@@ -26,6 +26,33 @@ test('stream result, stdin, multibyte boundaries and throwing progress callback'
   assert.equal(r.sessionId, sid);
   assert.equal(r.exitCode, 0);
 });
+test('forwards only parent text deltas and retains the authoritative final answer', async t => {
+  const streamed = [];
+  const delta = text => ({ type: 'stream_event', parent_tool_use_id: null,
+    event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  const r = await run(t, [init, delta('Hi '), { ...delta('child'), parent_tool_use_id: 'agent' },
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{}' } } },
+    delta('żółć'), result('Final answer')], {}, { onTextDelta(text) { streamed.push(text); } });
+  assert.deepEqual(streamed, ['Hi ', 'żółć']);
+  assert.equal(r.answer, 'Final answer');
+});
+test('retains reported cost and token usage without inventing unavailable values', async t => {
+  const r = await run(t, [init, { ...result(), total_cost_usd: 0, usage: {
+    input_tokens: 123, output_tokens: 45, cache_read_input_tokens: 7, cache_creation_input_tokens: 0,
+    ignored: 999, invalid: 'not a number',
+  } }]);
+  assert.equal(r.totalCostUsd, 0);
+  assert.deepEqual(r.usage, { input_tokens: 123, output_tokens: 45, cache_read_input_tokens: 7, cache_creation_input_tokens: 0 });
+  const missing = await run(t, [init, result()]);
+  assert.equal(missing.totalCostUsd, undefined);
+  assert.equal(missing.usage, undefined);
+});
+test('retains partial streamed text if Claude exits before a complete assistant message', async t => {
+  const r = await run(t, [init, { type: 'stream_event', event: { type: 'message_start' } },
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial text' } } }]);
+  assert.match(r.error, /without a result/);
+  assert.equal(r.answer, 'partial text');
+});
 test('error result retains partial answer and permission diagnostics', async t => {
   const r = await run(t, [init, assistant('partial'), { type: 'result', subtype: 'error_max_turns', is_error: true, errors: ['turn limit'], permission_denials: [{ tool_name: 'Bash' }] }]);
   assert.equal(r.error, 'turn limit');

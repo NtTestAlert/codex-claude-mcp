@@ -5,131 +5,177 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { CARD_URI, CARD_MIME, cardHtml, registerInlineCard } from '../dist/inlineCard.js';
+import { startLiveRun, readLiveRun } from '../dist/liveRuns.js';
+import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 
-// Exercise the embedded script against the host bridge without adding a DOM dependency.
-// This tests message handling, not whether a desktop client renders an iframe.
-function cardHarness() {
-  const sent = [];
-  const elements = Object.fromEntries(['input', 'output', 'status'].map(id => [id, { textContent: '' }]));
-  const style = {};
-  const listeners = new Map();
-  let timeout;
-  let disconnected = false;
-  let onResize;
+function harness(host = {}) {
+  const sent = [], listeners = new Map(), timers = new Map();
+  let timerId = 0, disconnected = false;
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status'].map(id => {
+    const handlers = new Map();
+    return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
+      classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
+      appendChild: node => { elements[id].textContent += node.textContent; }, trigger: name => handlers.get(name)?.() }];
+  }));
   const parent = { postMessage: message => sent.push(message) };
-  const window = {
-    parent,
-    addEventListener: (name, callback) => listeners.set(name, callback),
-    removeEventListener: (name, callback) => {
-      if (listeners.get(name) === callback) listeners.delete(name);
-    },
-  };
+  const window = { parent, openai: host.openai, addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: name => listeners.delete(name) };
   const script = cardHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
-  vm.runInNewContext(script, {
-    window,
-    document: {
-      getElementById: id => elements[id],
-      body: { getBoundingClientRect: () => ({ height: 160 }) },
-      documentElement: { clientWidth: 400, style },
-    },
-    setTimeout: callback => { timeout = callback; return 1; },
-    clearTimeout: () => { timeout = undefined; },
-    ResizeObserver: class {
-      constructor(callback) { onResize = callback; }
-      observe() {}
-      disconnect() { disconnected = true; }
-    },
+  vm.runInNewContext(script, { window,
+    document: { getElementById: id => elements[id], createTextNode: text => ({ textContent: text }),
+      body: { getBoundingClientRect: () => ({ height: 300 }) }, documentElement: { clientWidth: 400, style: {} } },
+    setTimeout: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: id => timers.delete(id),
+    ResizeObserver: class { observe() {} disconnect() { disconnected = true; } },
   });
   const receive = (message, source = parent) => listeners.get('message')?.({ source, data: { jsonrpc: '2.0', ...message } });
-  return {
-    sent, elements, style, receive,
-    initialize: () => receive({ id: sent[0].id, result: { protocolVersion: '2026-01-26', hostContext: { theme: 'dark' } } }),
-    expire: () => timeout?.(),
-    resize: () => onResize?.(),
+  return { sent, elements, receive,
+    initialize: () => receive({ id: sent[0].id, result: { protocolVersion: '2026-01-26',
+      hostContext: host.context ?? {}, hostCapabilities: host.capabilities ?? {} } }),
+    tick(ms) { const entry = [...timers].find(([, v]) => v.ms === ms); if (entry) { timers.delete(entry[0]); entry[1].fn(); } },
     disconnected: () => disconnected,
-    listening: () => listeners.has('message'),
   };
 }
 
-test('card uses inline-only handshake, renders request/result as text, and handles resizing/teardown', () => {
-  const h = cardHarness();
+test('card displays prompt and output without an inner collapsed wrapper and retains JSON details', () => {
+  const h = harness();
   assert.equal(h.sent[0].method, 'ui/initialize');
   assert.deepEqual([...h.sent[0].params.appCapabilities.availableDisplayModes], ['inline']);
-  assert.equal((cardHtml.match(/<details>/g) ?? []).length, 2);
-  assert.doesNotMatch(cardHtml, /<details\s+open|innerHTML|request-display-mode|https?:\/\//);
+  assert.match(cardHtml, /max-height:\s*4\.5em/);
+  assert.doesNotMatch(cardHtml, /<details id="card"/);
+  assert.doesNotMatch(cardHtml, /innerHTML|request-display-mode|https?:\/\//);
   h.initialize();
-  assert.equal(h.sent[1].method, 'ui/notifications/initialized');
-  assert.equal(h.style.colorScheme, 'dark');
-  assert.equal(h.sent[2].method, 'ui/notifications/size-changed');
-  const count = h.sent.length;
-  h.resize();
-  assert.equal(h.sent.length, count, 'same-size observations must not create a resize loop');
-  const input = { prompt: '<script>alert("untrusted")</script>\nżółć', cwd: 'C:\\project' };
+  const input = { prompt: '<script>unsafe</script>\nżółć', cwd: 'C:\\project' };
+  h.elements.prompt.scrollHeight = 160;
   h.receive({ method: 'ui/notifications/tool-input', params: { arguments: input } });
-  assert.deepEqual(JSON.parse(h.elements.input.textContent), input);
-  assert.equal(h.elements.status.textContent, 'Running…');
-  const result = { answer: 'Answer\nwith Unicode: żółć', duration_sec: 1.2, warnings: [] };
-  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: result } });
-  assert.deepEqual(JSON.parse(h.elements.output.textContent), result);
+  assert.equal(h.elements.prompt.textContent, input.prompt);
+  assert.equal(h.elements['prompt-toggle'].hidden, false);
+  h.elements['prompt-toggle'].trigger('click');
+  assert.equal(h.elements['prompt-toggle'].textContent, 'Show less');
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { answer: 'Hello', duration_sec: 3 } } });
+  assert.equal(h.elements.output.textContent, 'Hello');
   assert.equal(h.elements.status.textContent, 'Complete');
-  h.receive({ method: 'ui/notifications/host-context-changed', params: { theme: 'light' } });
-  assert.equal(h.style.colorScheme, 'light');
-  h.receive({ id: 2, method: 'ping' });
-  assert.equal(h.sent.at(-1).id, 2);
-  h.receive({ id: 3, method: 'ui/resource-teardown' });
-  assert.equal(h.sent.at(-1).id, 3);
+  assert.equal(JSON.parse(h.elements.json.textContent).result.duration_sec, 3);
+  h.receive({ id: 7, method: 'ui/resource-teardown' });
+  assert.equal(h.sent.at(-1).id, 7);
   assert.equal(h.disconnected(), true);
-  assert.equal(h.listening(), false);
 });
 
-test('card rejects non-parent messages and reports initialization failure', () => {
-  const h = cardHarness();
-  h.receive({ id: h.sent[0].id, result: {} }, {});
-  assert.equal(h.sent.length, 1);
-  h.expire();
-  assert.match(h.elements.status.textContent, /did not initialize/);
-  h.receive({ id: h.sent[0].id, error: { code: -32601, message: 'Unsupported' } });
-  assert.match(h.elements.status.textContent, /rejected/);
-});
-
-test('card restores input from result metadata and displays errors, text fallback, and cancellation', () => {
-  const h = cardHarness();
+test('card polls incremental output and stops on completion; user scrolling pauses following', () => {
+  const h = harness({ context: { toolInfo: { id: 17 } }, capabilities: { serverTools: {} } });
   h.initialize();
-  h.receive({ method: 'ui/notifications/tool-result', params: {
-    _meta: { bridgeInput: { prompt: 'Restored' } },
-    isError: true, content: [{ type: 'text', text: JSON.stringify({ answer: '', error: 'Failed to start' }) }],
-  } });
-  assert.equal(JSON.parse(h.elements.input.textContent).prompt, 'Restored');
-  assert.equal(JSON.parse(h.elements.output.textContent).error, 'Failed to start');
-  assert.equal(h.elements.status.textContent, 'Failed');
-  h.receive({ method: 'ui/notifications/tool-result', params: { content: [{ type: 'text', text: 'Plain text answer' }] } });
-  assert.equal(JSON.parse(h.elements.output.textContent).answer, 'Plain text answer');
-  h.receive({ method: 'ui/notifications/tool-result', params: { content: [{ type: 'text', text: 'null' }] } });
-  assert.equal(h.elements.output.textContent, 'null');
-  h.receive({ method: 'ui/notifications/tool-cancelled', params: { reason: 'User cancelled' } });
-  assert.equal(h.elements.status.textContent, 'Cancelled');
-  assert.equal(h.elements.output.textContent, 'User cancelled');
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello', cwd: 'C:\\p' } } });
+  h.tick(700);
+  let poll = h.sent.at(-1);
+  assert.equal(poll.method, 'tools/call');
+  assert.equal(poll.params.arguments.request_id, 17);
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, text: 'first ', next_offset: 6 } } });
+  assert.equal(h.elements.output.textContent, 'first ');
+  h.elements.output.scrollHeight = 500; h.elements.output.scrollTop = 0;
+  h.elements.output.trigger('scroll');
+  h.tick(700);
+  poll = h.sent.at(-1);
+  assert.equal(poll.params.arguments.offset, 6);
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, text: 'second', next_offset: 12 } } });
+  assert.equal(h.elements.output.textContent, 'first second');
+  assert.equal(h.elements.output.scrollTop, 0);
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { answer: 'authoritative' } } });
+  assert.equal(h.elements.output.textContent, 'authoritative');
+  const count = h.sent.length;
+  h.tick(700);
+  assert.equal(h.sent.length, count);
 });
 
-test('MCP Apps client can discover/read the resource and probe without calling Claude', async t => {
+test('immediate start result activates run-id polling and displays the final answer', () => {
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello', cwd: 'C:\\p' } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  assert.equal(h.elements.status.textContent, 'Running');
+  h.tick(700);
+  const poll = h.sent.at(-1);
+  assert.equal(poll.params.name, 'claude_run_status');
+  assert.equal(poll.params.arguments.run_id, 'run-id');
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, status: 'working', text: 'partial', next_offset: 7 } } });
+  assert.equal(h.elements.output.textContent, 'partial');
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  h.tick(700);
+  const finalPoll = h.sent.at(-1);
+  assert.equal(finalPoll.params.arguments.offset, 7);
+  h.receive({ id: finalPoll.id, result: { structuredContent: { available: true, status: 'completed', text: '', next_offset: 7, result: { answer: 'final', total_cost_usd: 0.0123, usage: { output_tokens: 45 } } } } });
+  assert.equal(h.elements.output.textContent, 'final');
+  assert.equal(h.elements.status.textContent, 'Complete');
+  assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.0123);
+  assert.equal(JSON.parse(h.elements.json.textContent).result.usage.output_tokens, 45);
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello', cwd: 'C:\\p' } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.0123);
+  assert.equal(h.elements.status.textContent, 'Complete');
+});
+
+test('a recreated card retrieves the completed run and its details', () => {
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-result', params: { _meta: { bridgeInput: { prompt: 'hello' } },
+    structuredContent: { status: 'working', run_id: 'run-id' } } });
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'completed', text: 'streamed', next_offset: 8,
+    result: { answer: 'complete', total_cost_usd: 0.25 } } } });
+  assert.equal(h.elements.prompt.textContent, 'hello');
+  assert.equal(h.elements.output.textContent, 'complete');
+  assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.25);
+});
+
+test('card falls back when host lacks live calls or rejects polling, and errors stay open', () => {
+  const h = harness();
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello' } } });
+  assert.match(h.elements.status.textContent, /live output unavailable/);
+  h.receive({ method: 'ui/notifications/tool-result', params: { isError: true,
+    content: [{ type: 'text', text: JSON.stringify({ answer: '', error: 'Failed to start' }) }] } });
+  assert.doesNotMatch(cardHtml, /<details id="card"/);
+  assert.equal(h.elements.output.textContent, 'Failed to start');
+  const h2 = harness({ context: { toolInfo: { id: 42 } }, capabilities: { serverTools: {} } });
+  h2.initialize();
+  h2.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello' } } });
+  h2.tick(700);
+  h2.receive({ id: h2.sent.at(-1).id, error: { code: -32601, message: 'Unsupported' } });
+  assert.match(h2.elements.status.textContent, /live output unavailable/);
+});
+
+test('live buffers isolate simultaneous runs, enforce bounds, and expire on close', () => {
+  const a = { prompt: 'one', cwd: 'x' }, b = { prompt: 'two', session_id: 's' };
+  const first = startLiveRun(1, a), second = startLiveRun(2, b);
+  assert.equal(startLiveRun(1, b), undefined);
+  first.append('hello'); second.append('other');
+  assert.equal(readLiveRun(1, b, 0).available, false);
+  assert.equal(readLiveRun(2, a, 0).available, false);
+  assert.equal(readLiveRun(1, a, 0).text, 'hello');
+  assert.equal(readLiveRun(1, a, 2).text, 'llo');
+  assert.equal(readLiveRun(1, a, 6).available, false);
+  first.append('x'.repeat(MAX_ANSWER_CHARS));
+  assert.equal(readLiveRun(1, a, 0).next_offset, MAX_ANSWER_CHARS);
+  assert.equal(readLiveRun(1, a, 0).truncated, true);
+  first.close(); second.close();
+  assert.equal(readLiveRun(1, a, 0).available, false);
+});
+
+test('MCP client discovers card and app-only status; probe needs no Claude', async t => {
   const server = new McpServer({ name: 'card-test', version: '1' });
   registerInlineCard(server);
   const ui = { mimeTypes: [CARD_MIME] };
-  const client = new Client({ name: 'ui-test', version: '1' }, {
-    capabilities: { extensions: { 'io.modelcontextprotocol/ui': ui } },
-  });
+  const client = new Client({ name: 'ui-test', version: '1' }, { capabilities: { extensions: { 'io.modelcontextprotocol/ui': ui } } });
   t.after(async () => { await client.close(); await server.close(); });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   const listed = await client.listTools();
-  assert.equal(listed.tools[0]._meta.ui.resourceUri, CARD_URI);
-  assert.equal(listed.tools[0].annotations.readOnlyHint, true);
+  assert.equal(listed.tools.find(t => t.name === 'claude_ui_probe')._meta.ui.resourceUri, CARD_URI);
+  assert.deepEqual(listed.tools.find(t => t.name === 'claude_ui_status')._meta.ui.visibility, ['app']);
   const resource = await client.readResource({ uri: CARD_URI });
   assert.equal(resource.contents[0].text, cardHtml);
   assert.equal(resource.contents[0].mimeType, CARD_MIME);
-  assert.deepEqual(resource.contents[0]._meta.ui.csp, { connectDomains: [], resourceDomains: [] });
   const probe = await client.callTool({ name: 'claude_ui_probe', arguments: { message: 'Hello' } });
   assert.equal(probe.structuredContent.answer, 'Hello');
-  assert.deepEqual(probe.structuredContent.client_ui_capability, ui);
-  assert.deepEqual(probe._meta.bridgeInput, { message: 'Hello' });
+  assert.deepEqual(probe._meta.bridgeInput, { prompt: 'Hello' });
+  assert.equal(probe.structuredContent.client_ui_capability.mimeTypes[0], CARD_MIME);
 });

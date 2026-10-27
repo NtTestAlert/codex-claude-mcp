@@ -6,6 +6,9 @@ Adapted from [cc-codex-mcp](https://github.com/NtTestAlert/cc-codex-mcp) by NtTe
 
 - `claude_ask`: start a session in a project directory.
 - `claude_followup`: resume an explicit bridge-owned session.
+- `claude_start` and `claude_wait`: start an interactive run immediately and retrieve its final result.
+- `claude_cancel`: stop an interactive run.
+- `claude_list_models`: list or refresh the Claude Code model catalogue for the isolated profile.
 - `claude_ui_probe`: test an inline input/output card without calling Claude.
 - Isolated `CLAUDE_CONFIG_DIR` (default `~/.claude-reviews`). Claude login credentials are never copied.
 - Per-call subprocesses, cross-process session locks, progress, timeout/cancellation
@@ -54,10 +57,28 @@ project instructions.
 
 ## Tools
 
-Both tools accept `prompt`, optional `model`, optional `effort`
+The conversation tools accept `prompt`, optional `model`, optional `effort`
 (`low`, `medium`, `high`, `xhigh`, `max`) and `timeout_sec` (10–3600, default 900).
 Model/effort support is validated by Claude itself; values are not translated
 from Codex reasoning levels.
+
+At MCP startup, the bridge asks the resolved Claude Code executable for its model
+catalogue using the isolated profile. This is an initialization request, not a
+model prompt. Discovered names, accepted values, and resolved model IDs appear in
+the MCP startup instructions, the tool descriptions, and `claude_list_models`. Call that tool with
+`{ "refresh": true }` to query again. The list reflects what Claude Code reports
+for that profile and provider; project settings, organization rules, or account
+availability can still prevent a particular request. The discovery process excludes
+project settings and disables hooks and MCP servers. If discovery times out or
+fails, the server starts normally, the tool reports `status: "unavailable"`, and
+explicit model aliases or provider IDs remain usable. No guessed model is chosen.
+
+For example, the Anthropic API model ID for Haiku 5.5 is `claude-haiku-5-5`;
+`haiku-5.5` is not that ID. The `haiku` alias may resolve differently on other
+providers. When the discovered catalogue uniquely identifies a versioned shorthand
+such as `haiku-5.5`, the bridge resolves it to that exact ID and reports the
+change in warnings; it does not guess when discovery is unavailable or ambiguous.
+When discovery is unavailable, check your provider's current model list.
 
 `claude_ask` also requires `cwd` and accepts `permission_mode`: `manual`
 (the default), `default` (legacy alias for manual), `acceptEdits`, `auto`, `plan`,
@@ -82,8 +103,22 @@ session's subsequent defaults; pass another override to change them again.
 A missing cwd is an error, never a fallback to another project.
 Different sessions can run concurrently; calls on the same session are serialized.
 
+For an interactive session whose host supports MCP Apps, use `claude_start` to
+start either a new conversation (`cwd`) or a follow-up (`session_id`), then
+call `claude_wait` with the returned `run_id`. The start acknowledgement is not
+Claude's answer. Start accepts the same model, effort and timeout options as
+the blocking tools; new conversations also accept `permission_mode` and
+`allowed_tools`. Follow-ups inherit their original directory and permissions,
+and can override model and effort. Use `claude_cancel` with the run ID to stop
+a run, then `claude_wait` to retrieve its result. Runs are local to the current
+server process; completed results expire after 30 minutes and at most 64 runs
+are retained. For CLI, non-interactive sessions, or hosts without MCP Apps, use
+`claude_ask` and `claude_followup` directly.
+
 Results contain `session_id`, `answer`, `duration_sec`, `warnings`, `activity`,
-and, when applicable, `error` and `answer_file`. Errors are also MCP tool errors.
+and, when applicable, `error`, `answer_file`, `total_cost_usd`, and token `usage`
+reported by Claude. Cost and usage are omitted when Claude does not provide them;
+they are not estimated. Errors are also MCP tool errors.
 Interrupted calls retain their bridge ID, but resuming is possible only if Claude
 created its underlying transcript before interruption. Long answers are retained
 in a temporary file; callers are responsible for removing retained answer files.
@@ -107,10 +142,14 @@ advice is attached only to errors recognized as authentication failures.
 
 ### Inline input/output card (experimental)
 
-Both conversation tools reference an MCP Apps resource at
+The conversation and interactive start tools reference an MCP Apps resource at
 `ui://claude/inspector.html`. In hosts that render MCP Apps from this connection,
-it displays a small inline card with separate expandable **Input** and **Output**
-sections. The card advertises only the inline display mode. Its HTML, CSS, and
+it displays an inline card with the prompt, a scrollable output area, and
+expandable JSON details. Long prompts can be expanded beyond three lines. The
+card follows new output while scrolled to the bottom and pauses following when
+the user scrolls up. The card keeps its contents visible whenever the host
+displays it; the host controls the outer tool-call row and when it opens or
+closes. The card advertises only the inline display mode. Its HTML, CSS, and
 JavaScript are self-contained; it needs no additional packages, HTTP server,
 external assets, or network permissions. Text-only clients retain the existing
 JSON results. The request is also included in result `_meta.bridgeInput` so a
@@ -119,21 +158,22 @@ host can restore the input when replaying a completed call.
 After building and reloading the existing MCP connection, call `claude_ui_probe`
 with `{ "message": "Inline card test" }` to test rendering without starting
 Claude or making a model call. Success means an inline Claude card appears and
-both sections expand in the chat. The probe also returns the client's advertised
+shows its prompt and output in the chat. The probe also returns the client's advertised
 `io.modelcontextprotocol/ui` capability (or `null` if absent); that report alone
 does not prove rendering. Protocol and script tests use simulated hosts and do
 not establish Codex desktop support. Desktop rendering remains unverified until
 the updated server is loaded and the card is observed in that client.
 
-This first card shows the completed result, not live Claude output. MCP Apps'
-`tool-input-partial` notification streams tool arguments, not answer text;
-`tool-result` delivers the completed response. Claude supports token events via
-`--include-partial-messages` with `--output-format stream-json --verbose`, but the
-bridge does not yet enable or forward those events. A live card would also need
-a host-supported update path, such as a read-only tool polling an in-memory run
-buffer while the main call is running. That can keep the stdio MCP transport;
-rendering the card before completion and concurrent UI tool calls would need
-verification in the target host first.
+The interactive start returns before Claude finishes, so the host can render its
+card while the run is in progress. The bridge captures partial text events in a
+bounded in-memory buffer, and the card polls by run ID when the host permits UI
+tool calls. If polling is unavailable, `claude_wait` still returns the final
+result. The blocking tools also attempt live polling when the host provides their
+request ID and renders the card before completion. Whether Codex desktop renders
+and updates the interactive card has not been verified. Optional
+host widget state preserves expansion and scroll preferences when supported;
+the host controls whether cards are recreated and whether its own tool row
+collapses.
 
 ### Timeouts
 
@@ -145,6 +185,20 @@ bridge's maximum 3600-second run plus cleanup. Progress notifications give
 visibility; they are not assumed to extend Codex's deadline.
 
 ## Configuration and isolation
+
+The optional bridge config file is `<CLAUDE_BRIDGE_HOME>/.codex-claude-mcp/config.json`
+(default `~/.claude-reviews/.codex-claude-mcp/config.json`). To disable the
+interactive card and its tools, create it with:
+
+```json
+{ "ui_enabled": false }
+```
+
+`ui_enabled` defaults to `true` when the file or setting is absent. When false,
+only `claude_ask`, `claude_followup`, and `claude_list_models` are exposed; the
+card resource and UI tools are not registered. The bridge reads this file once
+at startup, so reconnect or start a fresh session after changing it. Invalid JSON
+or a non-boolean `ui_enabled` prevents startup and reports an error.
 
 | Variable | Meaning |
 |---|---|

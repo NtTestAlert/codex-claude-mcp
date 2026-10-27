@@ -15,6 +15,7 @@ export interface RunOptions {
   expectedSessionId?: string;
   signal?: AbortSignal;
   onProgress?: (info: { elapsedSec: number; lastEvent?: string }) => void;
+  onTextDelta?: (text: string) => void;
 }
 
 export interface RunResult {
@@ -28,6 +29,8 @@ export interface RunResult {
   timedOut: boolean;
   stderrTail: string;
   activity: { commands: number; mcp_tool_calls: string[]; subagent_events: number };
+  totalCostUsd?: number;
+  usage?: Record<string, number>;
 }
 
 export const MAX_ANSWER_CHARS = 50_000;
@@ -50,7 +53,10 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
   const activity: RunResult['activity'] = { commands: 0, mcp_tool_calls: [], subagent_events: 0 };
   let sessionId: string | undefined;
   let answer = '';
+  let partialAnswer = '';
   let resultSeen = false;
+  let totalCostUsd: number | undefined;
+  let usage: Record<string, number> | undefined;
   let failure: string | undefined;
   let mismatch: string | undefined;
   let spawnError: Error | undefined;
@@ -78,6 +84,15 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
   };
   const event = (ev: Json) => {
     lastEvent = str(ev.type) ?? 'unknown';
+    if (ev.type === 'stream_event' && !ev.parent_tool_use_id && obj(ev.event)) {
+      if (ev.event.type === 'message_start') partialAnswer = '';
+      if (ev.event.type === 'content_block_delta' && obj(ev.event.delta) &&
+          ev.event.delta.type === 'text_delta' && typeof ev.event.delta.text === 'string') {
+        partialAnswer += ev.event.delta.text;
+        answer = partialAnswer;
+        try { o.onTextDelta?.(ev.event.delta.text); } catch { /* advisory callback */ }
+      }
+    }
     if (ev.type === 'system' && ev.subtype === 'init') {
       // Report only server identity and normalized status. Error payloads can
       // contain command arguments, environment values, or authentication URLs.
@@ -137,6 +152,16 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
     }
     if (ev.type === 'result') {
       resultSeen = true;
+      if (typeof ev.total_cost_usd === 'number' && Number.isFinite(ev.total_cost_usd) && ev.total_cost_usd >= 0) totalCostUsd = ev.total_cost_usd;
+      if (obj(ev.usage)) {
+        const fields = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
+        const values: Record<string, number> = {};
+        for (const field of fields) {
+          const value = ev.usage[field];
+          if (typeof value === 'number' && Number.isFinite(value) && value >= 0) values[field] = value;
+        }
+        if (Object.keys(values).length) usage = values;
+      }
       if (typeof ev.result === 'string' && ev.result.trim()) answer = ev.result;
       if (ev.is_error === true || (typeof ev.subtype === 'string' && ev.subtype !== 'success')) {
         failure = Array.isArray(ev.errors) && ev.errors.length
@@ -246,5 +271,6 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
     answer = answer.slice(0, MAX_ANSWER_CHARS) + (answerFile ? `\n\n[truncated — full answer at ${answerFile}]` : '\n\n[truncated]');
   }
   if (!error && !answer.trim()) warn('Claude finished without producing an answer');
-  return { sessionId, answer, answerFile, durationSec: elapsedSec(), warnings, error, exitCode, timedOut, stderrTail: stderr.join('\n'), activity };
+  return { sessionId, answer, answerFile, durationSec: elapsedSec(), warnings, error, exitCode, timedOut, stderrTail: stderr.join('\n'), activity,
+    ...(totalCostUsd === undefined ? {} : { totalCostUsd }), ...(usage ? { usage } : {}) };
 }

@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -42,6 +42,13 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
       },
       stderr: 'pipe',
     });
+    const send = transport.send.bind(transport);
+    transport.send = (message, ...rest) => {
+      if (message.method === 'tools/call' && message.params?.name === 'claude_ask' && message.params?.arguments?.prompt === '__live_output__') {
+        client.liveRequestId = message.id;
+      }
+      return send(message, ...rest);
+    };
     connections.add(client);
     await client.connect(transport);
     return client;
@@ -53,23 +60,35 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
     return { response, parsed };
   }
   let client = await connect();
+  assert.match(client.getInstructions(), /Haiku: haiku \(claude-haiku-5-5\)/);
+  assert.match(client.getInstructions(), /never invent a shorthand/);
+  assert.match(client.getInstructions(), /interactive sessions with an MCP Apps card/i);
+  assert.match(client.getInstructions(), /For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly/);
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup', 'claude_ui_probe']);
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_cancel', 'claude_followup', 'claude_list_models', 'claude_run_status', 'claude_start', 'claude_ui_probe', 'claude_ui_status', 'claude_wait']);
   const cardUri = 'ui://claude/inspector.html';
-  for (const tool of listed.tools) {
+  for (const tool of listed.tools.filter(tool => ['claude_ask', 'claude_followup', 'claude_start', 'claude_ui_probe'].includes(tool.name))) {
     assert.equal(tool._meta.ui.resourceUri, cardUri);
     assert.equal(tool._meta['openai/outputTemplate'], cardUri);
   }
+  assert.match(listed.tools.find(tool => tool.name === 'claude_ask').description, /claude-haiku-5-5/);
+  assert.match(listed.tools.find(tool => tool.name === 'claude_ask').inputSchema.properties.model.description, /claude-haiku-5-5/);
+  const modelList = await call(client, 'claude_list_models', {});
+  assert.equal(modelList.parsed.status, 'available');
+  assert.equal(modelList.parsed.models[0].value, 'haiku');
+  assert.equal(modelList.parsed.models[0].resolved_model, 'claude-haiku-5-5');
+  const refreshedList = await call(client, 'claude_list_models', { refresh: true });
+  assert.equal(refreshedList.parsed.status, 'available');
   const resources = await client.listResources();
   assert.equal(resources.resources.find(resource => resource.uri === cardUri)?.mimeType, 'text/html;profile=mcp-app');
   const card = await client.readResource({ uri: cardUri });
   assert.equal(card.contents[0].mimeType, 'text/html;profile=mcp-app');
-  assert.match(card.contents[0].text, /<summary>Input<\/summary>/);
-  assert.match(card.contents[0].text, /<summary>Output<\/summary>/);
+  assert.match(card.contents[0].text, /<div class="label">Prompt<\/div>/);
+  assert.match(card.contents[0].text, /<div class="label">Output<\/div>/);
   const probe = await call(client, 'claude_ui_probe', { message: 'No Claude call needed' });
   assert.equal(probe.parsed.answer, 'No Claude call needed');
   assert.equal(probe.parsed.client_ui_capability, null);
-  assert.deepEqual(probe.response._meta.bridgeInput, { message: 'No Claude call needed' });
+  assert.deepEqual(probe.response._meta.bridgeInput, { prompt: 'No Claude call needed' });
   await assert.rejects(fs.stat(log), { code: 'ENOENT' });
   const prompt = 'Review this\nwith "quotes", $variables, and Unicode: żółć. --model=not-an-option';
   const allowedTools = ['Read', 'Bash(git diff *)'];
@@ -158,9 +177,166 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.equal(authenticationFailure.response.isError, true);
   assert.match(authenticationFailure.parsed.error, /Invalid API key/);
   assert.match(authenticationFailure.parsed.error, /claude auth login/);
+
+  const shorthand = await call(client, 'claude_ask', { prompt: 'model shorthand', cwd: project, model: 'haiku-5.5' });
+  assert.equal(shorthand.response.isError, false);
+  assert.ok(JSON.parse(shorthand.parsed.answer).args.includes('--model=claude-haiku-5-5'));
+  assert.match(shorthand.parsed.warnings.join('\n'), /haiku-5\.5 resolved to claude-haiku-5-5/);
+
+  const liveInput = { prompt: '__live_output__', cwd: project };
+  const liveCall = call(client, 'claude_ask', liveInput);
+  const deadline = Date.now() + 6000;
+  let streamed;
+  while (Date.now() < deadline && !streamed?.text) {
+    if (client.liveRequestId !== undefined) {
+      const status = await call(client, 'claude_ui_status', { request_id: client.liveRequestId, ...liveInput, offset: 0 });
+      streamed = status.parsed;
+    }
+    if (!streamed?.text) await delay(50);
+  }
+  assert.equal(streamed?.text, 'live text');
+  const mismatch = await call(client, 'claude_ui_status', { request_id: client.liveRequestId, prompt: 'different', cwd: project, offset: 0 });
+  assert.equal(mismatch.parsed.available, false);
+  const finishedLive = await liveCall;
+  assert.equal(finishedLive.response.isError, false);
+  const expired = await call(client, 'claude_ui_status', { request_id: client.liveRequestId, ...liveInput, offset: 0 });
+  assert.equal(expired.parsed.available, false);
+
+  // Interactive start returns before the fake Claude result, while status and wait share the same run.
+  const interactiveInput = { prompt: '__live_output__', cwd: project, model: 'haiku-5.5', effort: 'low',
+    timeout_sec: 15, permission_mode: 'acceptEdits', allowed_tools: ['Read'] };
+  const started = await call(client, 'claude_start', interactiveInput);
+  assert.equal(started.parsed.status, 'working');
+  assert.match(started.parsed.run_id, /^[0-9a-f-]{36}$/);
+  assert.equal(started.response._meta.bridgeInput.prompt, interactiveInput.prompt);
+  let liveStatus;
+  const liveDeadline = Date.now() + 6000;
+  while (Date.now() < liveDeadline && !liveStatus?.text) {
+    liveStatus = (await call(client, 'claude_run_status', { run_id: started.parsed.run_id, offset: 0 })).parsed;
+    if (!liveStatus.text) await delay(50);
+  }
+  assert.equal(liveStatus.text, 'live text');
+  assert.equal(liveStatus.status, 'working');
+  const waited = await call(client, 'claude_wait', { run_id: started.parsed.run_id });
+  assert.equal(waited.response.isError, false);
+  const interactiveAnswer = JSON.parse(waited.parsed.answer);
+  assert.ok(interactiveAnswer.args.includes('--model=claude-haiku-5-5'));
+  assert.ok(interactiveAnswer.args.includes('--effort=low'));
+  assert.equal(interactiveAnswer.args[interactiveAnswer.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assert.ok(interactiveAnswer.args.includes('Read'));
+  const finalStatus = await call(client, 'claude_run_status', { run_id: started.parsed.run_id, offset: 0 });
+  assert.equal(finalStatus.parsed.status, 'completed');
+  assert.equal(finalStatus.parsed.result.session_id, waited.parsed.session_id);
+  assert.equal(finalStatus.parsed.result.total_cost_usd, 0.0123);
+  assert.equal(waited.parsed.total_cost_usd, 0.0123);
+  assert.equal(finalStatus.parsed.result.usage.output_tokens, 45);
+  const followStart = await call(client, 'claude_start', { prompt: 'interactive follow-up', session_id: waited.parsed.session_id, model: 'opus', effort: 'high', timeout_sec: 15 });
+  const followWait = await call(client, 'claude_wait', { run_id: followStart.parsed.run_id });
+  const followAnswer = JSON.parse(followWait.parsed.answer);
+  assert.equal(followAnswer.resumed, true);
+  assert.equal(followAnswer.cwd, project);
+  assert.equal(followAnswer.session, waited.parsed.session_id);
+  assert.ok(followAnswer.args.includes('--model=opus'));
+  assert.ok(followAnswer.args.includes('--effort=high'));
+  assert.equal(followAnswer.args[followAnswer.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assert.ok(followAnswer.args.includes('Read'));
+  const invalidFollow = await client.callTool({ name: 'claude_start', arguments: { prompt: 'bad', session_id: waited.parsed.session_id, permission_mode: 'manual' } });
+  assert.equal(invalidFollow.isError, true);
+  const invalidStart = await client.callTool({ name: 'claude_start', arguments: { prompt: 'bad' } });
+  assert.equal(invalidStart.isError, true);
+  const unknownWait = await client.callTool({ name: 'claude_wait', arguments: { run_id: randomUUID() } });
+  assert.equal(unknownWait.isError, true);
+  const cancelStart = await call(client, 'claude_start', { prompt: '__hang_until_cancelled__', cwd: project });
+  const cancelled = await call(client, 'claude_cancel', { run_id: cancelStart.parsed.run_id });
+  assert.equal(cancelled.parsed.status, 'cancelling');
+  const cancelResult = await client.callTool({ name: 'claude_wait', arguments: { run_id: cancelStart.parsed.run_id } });
+  assert.equal(cancelResult.isError, true);
 });
 
-test('closing MCP stdin cancels an active Claude process and removes configuration snapshots', { timeout: 20000 }, async t => {
+test('startup config controls UI tools, resources, and guidance', { timeout: 30000 }, async t => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-ui-config-'));
+  const home = path.join(temp, 'isolated'), source = path.join(temp, 'primary');
+  const configDir = path.join(home, '.codex-claude-mcp');
+  const configPath = path.join(configDir, 'config.json');
+  const clients = [];
+  t.after(async () => { for (const client of clients) await client.close(); await fs.rm(temp, { recursive: true, force: true }); });
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.mkdir(source);
+  const connect = async () => {
+    const client = new Client({ name: 'config-test', version: '1' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist', 'index.js')], cwd: root,
+      env: { CLAUDE_BRIDGE_HOME: home, CLAUDE_BRIDGE_SOURCE_HOME: source, CLAUDE_CONFIG_DIR: source,
+        CLAUDE_BRIDGE_CLAUDE_PATH: path.join(root, 'test', 'fixtures', 'integration-claude.mjs'),
+        INTEGRATION_CALL_LOG: path.join(temp, 'calls.jsonl') }, stderr: 'pipe' });
+    clients.push(client);
+    await client.connect(transport);
+    return client;
+  };
+  await fs.writeFile(configPath, JSON.stringify({ ui_enabled: false }));
+  const disabled = await connect();
+  assert.match(disabled.getInstructions(), /Use claude_ask.*claude_followup/);
+  assert.doesNotMatch(disabled.getInstructions(), /claude_start|claude_wait/);
+  let listed = await disabled.listTools();
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup', 'claude_list_models']);
+  for (const tool of listed.tools) {
+    assert.doesNotMatch(tool.description, /claude_start|claude_wait/);
+    assert.equal(tool._meta?.ui, undefined);
+  }
+  assert.equal(disabled.getServerCapabilities().resources, undefined);
+  const unavailable = await disabled.callTool({ name: 'claude_start', arguments: { prompt: 'hello', cwd: temp } });
+  assert.equal(unavailable.isError, true);
+  const ask = await disabled.callTool({ name: 'claude_ask', arguments: { prompt: 'hello', cwd: temp } });
+  assert.equal(ask.isError, false);
+  const follow = await disabled.callTool({ name: 'claude_followup', arguments: { prompt: 'follow', session_id: ask.structuredContent.session_id } });
+  assert.equal(follow.isError, false);
+  await disabled.callTool({ name: 'claude_list_models', arguments: { refresh: true } });
+  listed = await disabled.listTools();
+  assert.doesNotMatch(listed.tools.find(tool => tool.name === 'claude_ask').description, /claude_start|claude_wait/);
+  await fs.writeFile(configPath, JSON.stringify({ ui_enabled: true }));
+  assert.equal((await disabled.listTools()).tools.length, 3, 'config changes apply only on restart');
+  const enabled = await connect();
+  assert.match(enabled.getInstructions(), /claude_start.*claude_wait/);
+  assert.ok((await enabled.listTools()).tools.some(tool => tool.name === 'claude_start'));
+  assert.ok((await enabled.listResources()).resources.some(resource => resource.uri === 'ui://claude/inspector.html'));
+});
+
+test('invalid startup config fails clearly instead of silently enabling UI', async t => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-invalid-config-'));
+  t.after(() => fs.rm(temp, { recursive: true, force: true }));
+  const configDir = path.join(temp, '.codex-claude-mcp');
+  await fs.mkdir(configDir);
+  for (const contents of ['{', '{"ui_enabled":"false"}']) {
+    await fs.writeFile(path.join(configDir, 'config.json'), contents);
+    const child = spawnSync(process.execPath, [path.join(root, 'dist', 'index.js')], {
+      cwd: root, env: { ...process.env, CLAUDE_BRIDGE_HOME: temp }, encoding: 'utf8', timeout: 5000, windowsHide: true,
+    });
+    assert.notEqual(child.status, 0);
+    assert.match(child.stderr, /bridge config/i);
+  }
+});
+
+test('failed startup model discovery leaves the MCP bridge usable', { timeout: 20000 }, async t => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-no-models-'));
+  const client = new Client({ name: 'unavailable-models-test', version: '1' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist', 'index.js')], cwd: root,
+    env: { CLAUDE_BRIDGE_HOME: path.join(temp, 'isolated'), CLAUDE_BRIDGE_SOURCE_HOME: path.join(temp, 'primary'),
+      CLAUDE_CONFIG_DIR: path.join(temp, 'primary'), CLAUDE_BRIDGE_CLAUDE_PATH: path.join(root, 'test', 'fixtures', 'integration-claude.mjs'),
+      INTEGRATION_CALL_LOG: path.join(temp, 'calls.jsonl'), INTEGRATION_MODELS_FAIL: '1' }, stderr: 'pipe' });
+  t.after(async () => { await client.close(); await fs.rm(temp, { recursive: true, force: true }); });
+  await fs.mkdir(path.join(temp, 'primary'));
+  await client.connect(transport);
+  assert.match(client.getInstructions(), /Model discovery unavailable/);
+  const listed = await client.listTools();
+  assert.match(listed.tools.find(tool => tool.name === 'claude_ask').description, /Model discovery unavailable/);
+  const models = await client.callTool({ name: 'claude_list_models', arguments: {} });
+  assert.equal(models.structuredContent.status, 'unavailable');
+  assert.deepEqual(models.structuredContent.models, []);
+  const ask = await client.callTool({ name: 'claude_ask', arguments: { prompt: 'still works', cwd: temp, model: 'claude-haiku-5-5' } });
+  assert.equal(ask.isError, false);
+  assert.equal(JSON.parse(ask.structuredContent.answer).prompt, 'still works');
+});
+
+for (const toolName of ['claude_ask', 'claude_start']) test(`closing MCP stdin cancels an active ${toolName} process and removes configuration snapshots`, { timeout: 20000 }, async t => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-eof-'));
   const log = path.join(temp, 'calls.jsonl');
   const server = spawn(process.execPath, [path.join(root, 'dist', 'index.js')], {
@@ -193,7 +369,7 @@ test('closing MCP stdin cancels an active Claude process and removes configurati
   const send = message => server.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
   send({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'eof-test', version: '1' } } });
   send({ method: 'notifications/initialized' });
-  send({ id: 2, method: 'tools/call', params: { name: 'claude_ask', arguments: { prompt: '__hang_until_cancelled__', cwd: temp } } });
+  send({ id: 2, method: 'tools/call', params: { name: toolName, arguments: { prompt: '__hang_until_cancelled__', cwd: temp } } });
   const deadline = Date.now() + 8000;
   while (!started && Date.now() < deadline) {
     try { started = JSON.parse((await fs.readFile(log, 'utf8')).trim()); }
