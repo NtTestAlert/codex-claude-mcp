@@ -54,7 +54,23 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   }
   let client = await connect();
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup']);
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup', 'claude_ui_probe']);
+  const cardUri = 'ui://claude/inspector.html';
+  for (const tool of listed.tools) {
+    assert.equal(tool._meta.ui.resourceUri, cardUri);
+    assert.equal(tool._meta['openai/outputTemplate'], cardUri);
+  }
+  const resources = await client.listResources();
+  assert.equal(resources.resources.find(resource => resource.uri === cardUri)?.mimeType, 'text/html;profile=mcp-app');
+  const card = await client.readResource({ uri: cardUri });
+  assert.equal(card.contents[0].mimeType, 'text/html;profile=mcp-app');
+  assert.match(card.contents[0].text, /<summary>Input<\/summary>/);
+  assert.match(card.contents[0].text, /<summary>Output<\/summary>/);
+  const probe = await call(client, 'claude_ui_probe', { message: 'No Claude call needed' });
+  assert.equal(probe.parsed.answer, 'No Claude call needed');
+  assert.equal(probe.parsed.client_ui_capability, null);
+  assert.deepEqual(probe.response._meta.bridgeInput, { message: 'No Claude call needed' });
+  await assert.rejects(fs.stat(log), { code: 'ENOENT' });
   const prompt = 'Review this\nwith "quotes", $variables, and Unicode: żółć. --model=not-an-option';
   const allowedTools = ['Read', 'Bash(git diff *)'];
   const allowedArgs = ['--allowedTools', ...allowedTools];
@@ -66,6 +82,8 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   }
   const ask = await call(client, 'claude_ask', { prompt, cwd: project, model: 'sonnet', effort: 'high', permission_mode: 'acceptEdits', allowed_tools: allowedTools });
   assert.equal(ask.response.isError, false, ask.parsed.error);
+  assert.equal(ask.response._meta.bridgeInput.prompt, prompt);
+  assert.equal(ask.response._meta.bridgeInput.cwd, project);
   const id = ask.parsed.session_id;
   assert.match(id, /^[0-9a-f-]{36}$/);
   const first = JSON.parse(ask.parsed.answer);
@@ -88,6 +106,8 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
 
   const follow = await call(client, 'claude_followup', { prompt: 'Follow up', session_id: id, model: 'opus', effort: 'low' });
   assert.equal(follow.response.isError, false, follow.parsed.error);
+  assert.equal(follow.response._meta.bridgeInput.prompt, 'Follow up');
+  assert.equal(follow.response._meta.bridgeInput.session_id, id);
   const second = JSON.parse(follow.parsed.answer);
   assert.equal(second.cwd, project);
   assert.equal(second.session, id);
@@ -99,6 +119,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
 
   const unknown = await call(client, 'claude_followup', { prompt: 'Unknown', session_id: randomUUID() });
   assert.equal(unknown.response.isError, true);
+  assert.equal(unknown.response._meta.bridgeInput.prompt, 'Unknown');
   assert.match(unknown.parsed.error, /Unknown bridge session/);
   assert.equal((await fs.readFile(log, 'utf8')).trim().split('\n').length, 2);
 

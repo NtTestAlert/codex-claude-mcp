@@ -12,6 +12,7 @@ import { readSession, writeSession, type SessionInfo } from './sessions.js';
 import { runClaude } from './runner.js';
 import { withThreadLock } from './lock.js';
 import { checkAuth } from './auth.js';
+import { cardMeta, registerInlineCard } from './inlineCard.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const shutdown = new AbortController();
@@ -25,8 +26,9 @@ const common = {
   timeout_sec: z.number().int().min(10).max(3600).default(900),
 };
 type Input = { prompt: string; model?: string; effort?: string; timeout_sec: number; cwd?: string; session_id?: string; permission_mode?: typeof permissions[number]; allowed_tools?: string[] };
-function result(out: Record<string, unknown>) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(out, null, 2) }], structuredContent: out, isError: Boolean(out.error) };
+function result(out: Record<string, unknown>, input: Input) {
+  return { content: [{ type: 'text' as const, text: JSON.stringify(out, null, 2) }], structuredContent: out, isError: Boolean(out.error),
+    _meta: { bridgeInput: input } };
 }
 
 async function invoke(input: Input, extra: Extra) {
@@ -89,7 +91,7 @@ async function invoke(input: Input, extra: Extra) {
           ...(run.answerFile ? { answer_file: run.answerFile } : {}),
           ...(run.error ? { error: `${run.error}${run.stderrTail ? `\n${run.stderrTail}` : ''}${
             /not logged in|invalid api.?key|authentication[_ ](?:failed|error)|oauth token.*(?:expired|invalid)|please run.*\/login/i.test(`${run.error}\n${run.stderrTail}`)
-              ? `\nAuthenticate this profile: ${loginCommand(home)}` : ''}` } : {}) });
+              ? `\nAuthenticate this profile: ${loginCommand(home)}` : ''}` } : {}) }, input);
       } finally {
         // Config can contain MCP credentials; never retain it with a long answer.
         await Promise.all(['settings.json', 'mcp.json'].map(name => fs.rm(path.join(dir, name), { force: true })));
@@ -97,7 +99,7 @@ async function invoke(input: Input, extra: Extra) {
       }
     }, signal);
   } catch (e) {
-    return result({ session_id: sessionId ?? null, answer: '', duration_sec: (Date.now() - started) / 1000, warnings: [], error: (e as Error).message });
+    return result({ session_id: sessionId ?? null, answer: '', duration_sec: (Date.now() - started) / 1000, warnings: [], error: (e as Error).message }, input);
   }
 }
 
@@ -111,6 +113,7 @@ function tracked(input: Input, extra: Extra) {
   return promise;
 }
 server.registerTool('claude_ask', {
+  _meta: cardMeta,
   title: 'Ask Claude', description: 'Start an independent Claude Code session in a project. Claude can inspect the project and perform the requested task. Returns session_id for follow-ups. There is no enforced read-only sandbox.',
   inputSchema: { ...common, cwd: z.string().min(1),
     permission_mode: z.enum(permissions).default('manual').describe('Claude permission mode, fixed for this session. default is a legacy alias for manual; auto uses Claude policy. bypassPermissions explicitly skips Claude permission prompts.'),
@@ -119,10 +122,13 @@ server.registerTool('claude_ask', {
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 }, (input, extra) => tracked(input, extra as Extra));
 server.registerTool('claude_followup', {
+  _meta: cardMeta,
   title: 'Follow up with Claude', description: 'Continue a session returned by claude_ask, preserving its original directory and permission mode. Concurrent follow-ups on one session are serialized across bridge processes.',
   inputSchema: { ...common, session_id: z.string().uuid() },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 }, (input, extra) => tracked(input, extra as Extra));
+
+registerInlineCard(server);
 
 async function main() {
   if (process.argv.includes('--auth-status')) {

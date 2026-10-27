@@ -6,6 +6,7 @@ Adapted from [cc-codex-mcp](https://github.com/NtTestAlert/cc-codex-mcp) by NtTe
 
 - `claude_ask`: start a session in a project directory.
 - `claude_followup`: resume an explicit bridge-owned session.
+- `claude_ui_probe`: test an inline input/output card without calling Claude.
 - Isolated `CLAUDE_CONFIG_DIR` (default `~/.claude-reviews`). Claude login credentials are never copied.
 - Per-call subprocesses, cross-process session locks, progress, timeout/cancellation
   with process-tree cleanup, partial results and large-answer files.
@@ -103,6 +104,36 @@ MCP startup failures and authentication-required statuses in Claude's init event
 are reported in warnings even when stderr is empty. Error payloads that may
 contain configuration secrets are omitted from these startup warnings. Login
 advice is attached only to errors recognized as authentication failures.
+
+### Inline input/output card (experimental)
+
+Both conversation tools reference an MCP Apps resource at
+`ui://claude/inspector.html`. In hosts that render MCP Apps from this connection,
+it displays a small inline card with separate expandable **Input** and **Output**
+sections. The card advertises only the inline display mode. Its HTML, CSS, and
+JavaScript are self-contained; it needs no additional packages, HTTP server,
+external assets, or network permissions. Text-only clients retain the existing
+JSON results. The request is also included in result `_meta.bridgeInput` so a
+host can restore the input when replaying a completed call.
+
+After building and reloading the existing MCP connection, call `claude_ui_probe`
+with `{ "message": "Inline card test" }` to test rendering without starting
+Claude or making a model call. Success means an inline Claude card appears and
+both sections expand in the chat. The probe also returns the client's advertised
+`io.modelcontextprotocol/ui` capability (or `null` if absent); that report alone
+does not prove rendering. Protocol and script tests use simulated hosts and do
+not establish Codex desktop support. Desktop rendering remains unverified until
+the updated server is loaded and the card is observed in that client.
+
+This first card shows the completed result, not live Claude output. MCP Apps'
+`tool-input-partial` notification streams tool arguments, not answer text;
+`tool-result` delivers the completed response. Claude supports token events via
+`--include-partial-messages` with `--output-format stream-json --verbose`, but the
+bridge does not yet enable or forward those events. A live card would also need
+a host-supported update path, such as a read-only tool polling an in-memory run
+buffer while the main call is running. That can keep the stdio MCP transport;
+rendering the card before completion and concurrent UI tool calls would need
+verification in the target host first.
 
 ### Timeouts
 
