@@ -17,6 +17,7 @@ import { checkAuth } from './auth.js';
 import { cardMeta, registerInlineCard } from './inlineCard.js';
 import { startLiveRun, readLiveRun } from './liveRuns.js';
 import { discoverModels, modelGuidance, resolveModelShorthand, type ModelCatalog } from './models.js';
+import { getQuota } from './quota.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 async function readBridgeConfig(): Promise<{ uiMode: boolean | 'auto'; modelRefreshSec: number }> {
@@ -305,6 +306,15 @@ server.registerTool('claude_list_models', {
 }, async ({ refresh }) => {
   const current = refresh ? await refreshModels() : currentCatalog();
   return { content: [{ type: 'text', text: JSON.stringify(current, null, 2) }], structuredContent: { ...current } };
+});
+server.registerTool('claude_get_quota', {
+  title: 'Get Claude subscription quota',
+  description: 'Read the isolated Claude subscription account’s reported five-hour and weekly usage percentages and reset times. Returns unavailable when the subscription login or usage service does not provide them. Uses an undocumented Claude usage endpoint; does not report API-key rate limits.',
+  inputSchema: {},
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+}, async () => {
+  const quota = await getQuota(await ensureHome());
+  return { content: [{ type: 'text' as const, text: JSON.stringify(quota, null, 2) }], structuredContent: quota };
 });
 let refreshTimer: NodeJS.Timeout | undefined;
 let refreshStopped = false;

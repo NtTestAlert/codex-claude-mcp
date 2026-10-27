@@ -9,6 +9,7 @@ Adapted from [cc-codex-mcp](https://github.com/NtTestAlert/cc-codex-mcp) by NtTe
 - `claude_start` and `claude_wait`: start an interactive run immediately and retrieve its final result.
 - `claude_cancel`: stop an interactive run.
 - `claude_list_models`: list or refresh the Claude Code model catalogue for the isolated profile.
+- `claude_get_quota`: read available five-hour and weekly subscription usage and reset times.
 - `claude_ui_probe`: test an inline input/output card without calling Claude.
 - Isolated `CLAUDE_CONFIG_DIR` (default `~/.claude-reviews`). Claude login credentials are never copied.
 - Per-call subprocesses, cross-process session locks, progress, timeout/cancellation
@@ -106,6 +107,13 @@ overrides persist in bridge metadata. These overrides intentionally change that
 session's subsequent defaults; pass another override to change them again.
 A missing cwd is an error, never a fallback to another project.
 Different sessions can run concurrently; calls on the same session are serialized.
+
+`claude_get_quota` reads the isolated profile's Claude subscription OAuth login
+and requests the five-hour and weekly utilization and reset times from Claude's
+undocumented usage endpoint. It returns `status: "unavailable"` when credentials,
+both usage windows, or the endpoint are unavailable; missing individual windows
+are `null`. It does not refresh credentials or query API-key rate limits. The
+endpoint may change or return rate-limit errors independently of model calls.
 
 For an interactive session whose host supports MCP Apps, use `claude_start` to
 start either a new conversation (`cwd`) or a follow-up (`session_id`), then
@@ -210,7 +218,7 @@ remains available. Set it alongside `ui_enabled`, for example:
 the bridge enables the card only when the client advertises MCP Apps support for
 `text/html;profile=mcp-app` during initialization. Set `true` or `"true"` to
 force enablement, or `false` or `"false"` to disable it. When disabled,
-only `claude_ask`, `claude_followup`, and `claude_list_models` are exposed; the
+only `claude_ask`, `claude_followup`, `claude_list_models`, and `claude_get_quota` are exposed; the
 card resource and UI tools are not registered. The bridge reads this file once
 at startup, so reconnect or start a fresh session after changing it. Invalid JSON
 or an unsupported setting value prevents startup and reports an error.

@@ -67,7 +67,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.match(client.getInstructions(), /interactive sessions with an MCP Apps card/i);
   assert.match(client.getInstructions(), /For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly/);
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_cancel', 'claude_followup', 'claude_list_models', 'claude_run_status', 'claude_start', 'claude_ui_probe', 'claude_ui_status', 'claude_wait']);
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_cancel', 'claude_followup', 'claude_get_quota', 'claude_list_models', 'claude_run_status', 'claude_start', 'claude_ui_probe', 'claude_ui_status', 'claude_wait']);
   const cardUri = 'ui://claude/inspector.html';
   for (const tool of listed.tools.filter(tool => ['claude_ask', 'claude_followup', 'claude_start', 'claude_ui_probe'].includes(tool.name))) {
     assert.equal(tool._meta.ui.resourceUri, cardUri);
@@ -77,6 +77,9 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.match(listed.tools.find(tool => tool.name === 'claude_ask').inputSchema.properties.model.description, /claude-haiku-5-5/);
   const modelList = await call(client, 'claude_list_models', {});
   assert.equal(modelList.parsed.status, 'available');
+  const quota = await call(client, 'claude_get_quota', {});
+  assert.equal(quota.parsed.status, 'unavailable');
+  assert.equal(quota.parsed.five_hour, null);
   assert.equal(modelList.parsed.models[0].value, 'haiku');
   assert.equal(modelList.parsed.models[0].resolved_model, 'claude-haiku-5-5');
   const refreshedList = await call(client, 'claude_list_models', { refresh: true });
@@ -281,7 +284,7 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
   assert.match(disabled.getInstructions(), /Use claude_ask.*claude_followup/);
   assert.doesNotMatch(disabled.getInstructions(), /claude_start|claude_wait/);
   let listed = await disabled.listTools();
-  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup', 'claude_list_models']);
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_followup', 'claude_get_quota', 'claude_list_models']);
   for (const tool of listed.tools) {
     assert.doesNotMatch(tool.description, /claude_start|claude_wait/);
     assert.equal(tool._meta?.ui, undefined);
@@ -297,7 +300,7 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
   listed = await disabled.listTools();
   assert.doesNotMatch(listed.tools.find(tool => tool.name === 'claude_ask').description, /claude_start|claude_wait/);
   await fs.writeFile(configPath, JSON.stringify({ ui_enabled: true }));
-  assert.equal((await disabled.listTools()).tools.length, 3, 'config changes apply only on restart');
+  assert.equal((await disabled.listTools()).tools.length, 4, 'config changes apply only on restart');
   const enabled = await connect();
   assert.match(enabled.getInstructions(), /claude_start.*claude_wait/);
   assert.ok((await enabled.listTools()).tools.some(tool => tool.name === 'claude_start'));
