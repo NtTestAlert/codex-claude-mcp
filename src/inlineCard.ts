@@ -20,6 +20,8 @@ export const cardHtml = String.raw`<!doctype html>
     summary, button { cursor: pointer; }
     summary { font-weight: 600; }
     .state { color: var(--color-text-secondary, GrayText); font-weight: 400; font-size: 12px; margin-left: 8px; }
+    .run-info { color: var(--color-text-secondary, GrayText); font-size: 12px; margin: 4px 0; overflow-wrap: anywhere; }
+    .cancel { margin-left: 8px; font-size: 12px; }
     .quota { color: var(--color-text-secondary, GrayText); font-size: 12px; margin: 4px 0; overflow-wrap: anywhere; }
     .label { font-weight: 600; margin: 10px 0 4px; }
     .prompt { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5em; }
@@ -36,7 +38,8 @@ export const cardHtml = String.raw`<!doctype html>
 </head>
 <body>
   <div id="card">
-    <div class="state" id="status" role="status">Connecting…</div>
+    <div><span class="state" id="status" role="status">Connecting…</span><button id="cancel" class="cancel" type="button" hidden>Cancel</button></div>
+    <div id="run-info" class="run-info" hidden></div>
     <div id="quota" class="quota" hidden></div>
     <div class="label">Prompt</div>
     <div id="prompt" class="prompt clamped">Waiting for input…</div>
@@ -52,10 +55,12 @@ export const cardHtml = String.raw`<!doctype html>
       const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
       const cost = el('cost'), requestCost = el('request-cost');
       const quota = el('quota');
+      const cancel = el('cancel'), runInfo = el('run-info');
       const initId = 'claude-inspector-init';
       let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
-      let polling = false, timer, pollRequest, quotaRequest, requestSeq = 0, follow = true, hostContext;
+      let polling = false, timer, pollRequest, quotaRequest, cancelRequest, cancelTimer, requestSeq = 0, follow = true, hostContext;
       let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
+      let lastModel, lastEffort;
       const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
       const format = value => JSON.stringify(value, null, 2);
       const showCost = result => {
@@ -68,6 +73,20 @@ export const cardHtml = String.raw`<!doctype html>
         requestCost.textContent = requestCost.hidden ? '' : '$' + request.toFixed(3);
         requestCost.title = 'This request';
       };
+      const showRunInfo = data => {
+        const parts = [];
+        if (typeof data?.model === 'string' && data.model) lastModel = data.model;
+        if (typeof data?.effort === 'string' && data.effort) lastEffort = data.effort;
+        if (typeof data?.phase === 'string' && !finished) parts.push(data.phase);
+        if (typeof data?.elapsed_sec === 'number' && Number.isFinite(data.elapsed_sec) && data.elapsed_sec >= 0) {
+          const seconds = Math.floor(data.elapsed_sec);
+          parts.push(Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0'));
+        }
+        parts.push('Model: ' + (lastModel ?? 'default'));
+        parts.push('Effort: ' + (lastEffort ?? 'default'));
+        runInfo.textContent = parts.join(' · '); runInfo.hidden = false;
+      };
+      const hideCancel = () => { cancel.hidden = true; cancel.disabled = false; clearTimeout(cancelTimer); cancelRequest = undefined; };
       const resize = () => {
         if (!ready) return;
         const width = Math.ceil(document.documentElement.clientWidth);
@@ -141,6 +160,17 @@ export const cardHtml = String.raw`<!doctype html>
       promptToggle.addEventListener('click', () => { promptExpanded = !promptExpanded; showPrompt(input?.prompt); save(); resize(); });
       output.addEventListener('scroll', () => { follow = output.scrollHeight - output.scrollTop - output.clientHeight < 24; save(); });
       detail.addEventListener('toggle', () => { save(); resize(); });
+      cancel.addEventListener('click', () => {
+        if (!canCallTools || !runId || finished || cancelRequest || cancel.disabled) return;
+        cancel.disabled = true; cancel.textContent = 'Cancelling…';
+        cancelRequest = 'claude-cancel-' + (++requestSeq);
+        send({ id: cancelRequest, method: 'tools/call', params: { name: 'claude_cancel', arguments: { run_id: runId } } });
+        cancelTimer = setTimeout(() => {
+          if (!cancelRequest || finished) return;
+          cancelRequest = undefined; cancel.disabled = false; cancel.textContent = 'Retry cancel';
+          status.textContent = 'Cancellation not confirmed';
+        }, 5000);
+      });
       const stopPolling = () => { polling = false; clearTimeout(timer); pollRequest = undefined; };
       const schedule = () => { if (polling && !finished) timer = setTimeout(poll, 700); };
       const poll = () => {
@@ -173,6 +203,14 @@ export const cardHtml = String.raw`<!doctype html>
           resize(); return;
         }
         if (!ready) return;
+        if (cancelRequest && message.id === cancelRequest && !message.method) {
+          clearTimeout(cancelTimer); cancelRequest = undefined;
+          if (finished) return;
+          if (message.error || message.result?.isError) {
+            cancel.disabled = false; cancel.textContent = 'Retry cancel'; status.textContent = 'Cancellation failed';
+          } else { cancel.disabled = true; cancel.textContent = 'Cancelling…'; status.textContent = 'Cancelling'; }
+          resize(); return;
+        }
         if (quotaRequest && message.id === quotaRequest && !message.method) {
           quotaRequest = undefined;
           const response = message.result;
@@ -190,17 +228,20 @@ export const cardHtml = String.raw`<!doctype html>
           if (message.error || response?.isError) { stopPolling(); status.textContent = 'Running · live output unavailable'; return; }
           if (data?.available) {
             missingPolls = 0;
+            showRunInfo(data);
             if (typeof data.text === 'string' && data.text) setOutput(data.text, true);
             if (Number.isSafeInteger(data.next_offset) && data.next_offset >= offset) offset = data.next_offset;
             if (data.truncated) status.textContent = 'Running · live output truncated';
-            if (data.status === 'completed' || data.status === 'failed') {
+            if (data.status === 'cancelling') status.textContent = 'Cancelling';
+            if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
               finished = true; stopPolling();
+              hideCancel(); showRunInfo(data);
               const result = data.result ?? {};
               json.textContent = format({ input, result });
               showCost(result);
               requestQuota();
               setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
-              status.textContent = data.status === 'failed' ? 'Failed' : 'Complete';
+              status.textContent = data.status === 'cancelled' ? 'Cancelled' : data.status === 'failed' ? 'Failed' : 'Complete';
               save(); resize(); return;
             }
           } else if (++missingPolls >= 8) {
@@ -229,11 +270,14 @@ export const cardHtml = String.raw`<!doctype html>
               stopPolling(); runId = result.run_id; offset = 0;
               json.textContent = format({ input, start: result });
               polling = canCallTools;
+              cancel.hidden = !canCallTools; cancel.disabled = false; cancel.textContent = 'Cancel';
+              showRunInfo({ model: input?.model, effort: input?.effort });
               status.textContent = polling ? 'Running' : 'Running · live output unavailable';
               if (polling) schedule();
               break;
             }
             finished = true; stopPolling();
+            hideCancel(); showRunInfo({ elapsed_sec: result?.duration_sec, model: lastModel ?? input?.model, effort: lastEffort ?? input?.effort });
             json.textContent = format({ input, result });
             showCost(result);
             requestQuota();
@@ -243,12 +287,12 @@ export const cardHtml = String.raw`<!doctype html>
             save(); break;
           }
           case 'ui/notifications/tool-cancelled':
-            finished = true; stopPolling(); status.textContent = 'Cancelled';
+            finished = true; stopPolling(); hideCancel(); status.textContent = 'Cancelled';
             setOutput(params.reason ?? 'Tool call cancelled', false); break;
           case 'ui/notifications/host-context-changed': context(params); break;
           case 'ping': if (message.id !== undefined) send({ id: message.id, result: {} }); break;
           case 'ui/resource-teardown':
-            stopPolling(); clearTimeout(timeout); clearTimeout(widgetTimer); persist(); observer?.disconnect();
+            stopPolling(); hideCancel(); clearTimeout(timeout); clearTimeout(widgetTimer); persist(); observer?.disconnect();
             window.removeEventListener('message', receive);
             if (message.id !== undefined) send({ id: message.id, result: {} }); return;
           default:

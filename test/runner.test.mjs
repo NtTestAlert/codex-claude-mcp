@@ -92,6 +92,17 @@ test('counts PowerShell tool calls as commands', async t => {
   ] } }, result()]);
   assert.equal(r.activity.commands, 2);
 });
+test('reports parent activity and the model from Claude events', async t => {
+  const status = [];
+  const tool = name => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name }] } });
+  await run(t, [{ ...init, model: 'actual-model' }, tool('Read'), tool('Bash'),
+    { ...tool('Write'), parent_tool_use_id: 'child' },
+    { type: 'user', message: { content: [{ type: 'tool_result' }] } },
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'ok' } } }, result()], {},
+  { onStatus(info) { status.push(info); } });
+  assert.deepEqual(status, [{ phase: 'Thinking', model: 'actual-model' }, { phase: 'Reading files' },
+    { phase: 'Running a command' }, { phase: 'Thinking' }, { phase: 'Responding' }]);
+});
 test('tracks tool calls once and ignores subagent answer text', async t => {
   const tool = { type: 'assistant', message: { content: [
     { type: 'tool_use', id: 'a', name: 'Bash' }, { type: 'tool_use', id: 'b', name: 'mcp__example__lookup' },

@@ -24,7 +24,7 @@ const request = {
   entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT ?? null,
 };
 appendFileSync(process.env.INTEGRATION_CALL_LOG, JSON.stringify(request) + '\n');
-console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session }));
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session, model: value('--model') ?? 'fixture-model' }));
 if (prompt === '__live_output__') {
   console.log(JSON.stringify({ type: 'stream_event', parent_tool_use_id: null,
     event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'live text' } } }));

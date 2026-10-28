@@ -236,6 +236,10 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   }
   assert.equal(liveStatus.text, 'live text');
   assert.equal(liveStatus.status, 'working');
+  assert.equal(liveStatus.model, 'claude-haiku-5-5');
+  assert.equal(liveStatus.effort, 'low');
+  assert.equal(liveStatus.phase, 'Responding');
+  assert.ok(liveStatus.elapsed_sec >= 0);
   const waited = await call(client, 'claude_wait', { run_id: started.parsed.run_id });
   assert.equal(waited.response.isError, false);
   const interactiveAnswer = JSON.parse(waited.parsed.answer);
@@ -270,6 +274,8 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.equal(cancelled.parsed.status, 'cancelling');
   const cancelResult = await client.callTool({ name: 'claude_wait', arguments: { run_id: cancelStart.parsed.run_id } });
   assert.equal(cancelResult.isError, true);
+  const cancelledStatus = await call(client, 'claude_run_status', { run_id: cancelStart.parsed.run_id, offset: 0 });
+  assert.equal(cancelledStatus.parsed.status, 'cancelled');
 });
 
 test('startup config controls UI tools, resources, and guidance', { timeout: 30000 }, async t => {

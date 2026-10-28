@@ -11,7 +11,7 @@ import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 function harness(host = {}) {
   const sent = [], listeners = new Map(), timers = new Map();
   let timerId = 0, disconnected = false;
-  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota'].map(id => {
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota', 'run-info', 'cancel'].map(id => {
     const handlers = new Map();
     return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
@@ -152,6 +152,48 @@ test('immediate start result activates run-id polling and displays the final ans
   h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
   assert.equal(JSON.parse(h.elements.json.textContent).result.total_cost_usd, 0.0123);
   assert.equal(h.elements.status.textContent, 'Complete');
+});
+
+test('interactive card displays live run details and cancels through the host', () => {
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello', model: 'opus', effort: 'high' } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  assert.equal(h.elements.cancel.hidden, false);
+  h.tick(700);
+  const poll = h.sent.at(-1);
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, status: 'working', text: '', next_offset: 0,
+    phase: 'Reading files', elapsed_sec: 62, model: 'claude-opus', effort: 'high' } } });
+  assert.equal(h.elements['run-info'].textContent, 'Reading files · 1:02 · Model: claude-opus · Effort: high');
+  h.elements.cancel.trigger('click');
+  const cancel = h.sent.at(-1);
+  assert.equal(cancel.params.name, 'claude_cancel');
+  assert.equal(cancel.params.arguments.run_id, 'run-id');
+  assert.equal(h.elements.cancel.disabled, true);
+  h.receive({ id: cancel.id, result: { structuredContent: { status: 'cancelling' } } });
+  assert.equal(h.elements.status.textContent, 'Cancelling');
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'cancelled', text: '', next_offset: 0,
+    elapsed_sec: 63, model: 'claude-opus', effort: 'high', result: { error: 'Cancelled' } } } });
+  assert.equal(h.elements.status.textContent, 'Cancelled');
+  assert.equal(h.elements.cancel.hidden, true);
+  assert.equal(h.elements['run-info'].textContent, '1:03 · Model: claude-opus · Effort: high');
+  assert.equal(JSON.parse(h.elements.json.textContent).result.error, 'Cancelled');
+});
+
+test('cancel is unavailable without host tool calls and can be retried after an error', () => {
+  const noTools = harness();
+  noTools.initialize();
+  noTools.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  assert.equal(noTools.elements.cancel.hidden, true);
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  h.elements.cancel.trigger('click');
+  h.receive({ id: h.sent.at(-1).id, error: { code: -32601, message: 'Unsupported' } });
+  assert.equal(h.elements.cancel.disabled, false);
+  assert.equal(h.elements.cancel.textContent, 'Retry cancel');
+  assert.equal(h.elements.status.textContent, 'Cancellation failed');
 });
 
 test('a recreated card retrieves the completed run and its details', () => {

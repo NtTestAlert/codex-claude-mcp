@@ -16,6 +16,7 @@ export interface RunOptions {
   signal?: AbortSignal;
   onProgress?: (info: { elapsedSec: number; lastEvent?: string }) => void;
   onTextDelta?: (text: string) => void;
+  onStatus?: (info: { phase?: string; model?: string }) => void;
 }
 
 export interface RunResult {
@@ -82,18 +83,21 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
     lastProgress = Date.now();
     try { o.onProgress({ elapsedSec: elapsedSec(), lastEvent }); } catch { /* advisory callback */ }
   };
+  const status = (info: { phase?: string; model?: string }) => { try { o.onStatus?.(info); } catch { /* advisory callback */ } };
   const event = (ev: Json) => {
     lastEvent = str(ev.type) ?? 'unknown';
     if (ev.type === 'stream_event' && !ev.parent_tool_use_id && obj(ev.event)) {
-      if (ev.event.type === 'message_start') partialAnswer = '';
+      if (ev.event.type === 'message_start') { partialAnswer = ''; status({ phase: 'Thinking' }); }
       if (ev.event.type === 'content_block_delta' && obj(ev.event.delta) &&
           ev.event.delta.type === 'text_delta' && typeof ev.event.delta.text === 'string') {
         partialAnswer += ev.event.delta.text;
         answer = partialAnswer;
+        status({ phase: 'Responding' });
         try { o.onTextDelta?.(ev.event.delta.text); } catch { /* advisory callback */ }
       }
     }
     if (ev.type === 'system' && ev.subtype === 'init') {
+      status({ phase: 'Thinking', ...(typeof ev.model === 'string' && ev.model ? { model: ev.model } : {}) });
       // Report only server identity and normalized status. Error payloads can
       // contain command arguments, environment values, or authentication URLs.
       const serverLabel = (value: unknown) => {
@@ -145,11 +149,20 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
           if (name.startsWith('mcp__')) activity.mcp_tool_calls.push(name);
           if (name === 'Agent' || name === 'Task') activity.subagent_events++;
           lastEvent = `tool:${name}`;
+          if (!ev.parent_tool_use_id) {
+            const phase = name === 'Bash' || name === 'PowerShell' ? 'Running a command'
+              : ['Read', 'Glob', 'Grep', 'LS'].includes(name) ? 'Reading files'
+              : ['Edit', 'Write', 'NotebookEdit'].includes(name) ? 'Editing files'
+              : name === 'Agent' || name === 'Task' ? 'Working with an agent' : 'Using a tool';
+            status({ phase });
+          }
         }
       }
       if (text.length && !ev.parent_tool_use_id) answer = text.join('\n');
       if (ev.error) failure = message(ev.error);
     }
+    if (ev.type === 'user' && !ev.parent_tool_use_id && obj(ev.message) && Array.isArray(ev.message.content) &&
+        ev.message.content.some(block => obj(block) && block.type === 'tool_result')) status({ phase: 'Thinking' });
     if (ev.type === 'result') {
       resultSeen = true;
       if (typeof ev.total_cost_usd === 'number' && Number.isFinite(ev.total_cost_usd) && ev.total_cost_usd >= 0) totalCostUsd = ev.total_cost_usd;

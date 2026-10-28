@@ -97,6 +97,7 @@ async function invoke(input: Input, extra: Extra, live?: ReturnType<typeof start
         const requestedModel = input.model ?? info.model;
         const model = resolveModelShorthand(requestedModel, catalog);
         const effort = input.effort ?? info.effort;
+        live?.update({ phase: 'Starting Claude', ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
         const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
           '--permission-mode', info.permission_mode,
           ...(info.allowed_tools?.length ? ['--allowedTools', ...info.allowed_tools] : []),
@@ -116,6 +117,7 @@ async function invoke(input: Input, extra: Extra, live?: ReturnType<typeof start
         const run = await runClaude({ command, args, cwd: info.cwd, env, stdin: input.prompt,
           expectedSessionId: sessionId, outputFile: path.join(dir, 'answer.txt'), timeoutMs: remaining, signal,
           onTextDelta: live?.append,
+          onStatus: live?.update,
           onProgress: token === undefined ? undefined : ({ elapsedSec, lastEvent }) => {
             void extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token,
               progress: Math.max(1, Math.round(elapsedSec)), message: `Claude running for ${Math.round(elapsedSec)}s${lastEvent ? ` (${lastEvent})` : ''}` } }).catch(() => {});
@@ -223,6 +225,7 @@ const startTool = uiEnabled ? server.registerTool('claude_start', {
   interactiveRuns.set(runId, run);
   inflight.add(execution);
   void execution.then(response => {
+    live.finish();
     run.result = response;
     run.expiry = setTimeout(() => { if (interactiveRuns.get(runId) === run) { interactiveRuns.delete(runId); live.close(); } }, INTERACTIVE_RETENTION_MS);
     run.expiry.unref();
@@ -265,7 +268,7 @@ server.registerTool('claude_run_status', {
   const run = interactiveRuns.get(run_id);
   if (!run) return { content: [{ type: 'text' as const, text: JSON.stringify({ available: false }) }], structuredContent: { available: false } };
   const data = { ...readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset),
-    status: run.result ? (run.result.isError ? 'failed' : 'completed') : 'working',
+    status: run.result ? (run.result.isError ? (run.controller.signal.aborted ? 'cancelled' : 'failed') : 'completed') : run.controller.signal.aborted ? 'cancelling' : 'working',
     ...(run.result ? { result: run.result.structuredContent } : {}) };
   return { content: [{ type: 'text' as const, text: JSON.stringify(data) }], structuredContent: data };
 });

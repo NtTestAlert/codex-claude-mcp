@@ -191,6 +191,12 @@ preserves expansion and scroll preferences when supported;
 the host controls whether cards are recreated and whether its own tool row
 collapses.
 
+During an interactive run, the card shows elapsed time, model, effort and a
+compact activity derived from Claude's events. When Claude does not report the
+model or effort, the card shows the requested setting or `default`; `default`
+does not identify the actual choice. A Cancel button is available for interactive
+runs when the host permits app tool calls. The JSON details remain available.
+
 ### Timeouts
 
 `timeout_sec` is the bridge's call budget, including waiting for a session lock.
