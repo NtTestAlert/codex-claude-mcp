@@ -278,6 +278,33 @@ Claude; an API key can select API billing rather than subscription authenticatio
 
 ## Development
 
+### Experimental persistent Agent SDK benchmark
+
+The `agents-sdk` branch contains an isolated warm-session prototype in
+`src/sdkWarm.ts`. It holds one Claude process open for sequential turns in one
+conversation. Independent conversations use separate processes. This prototype
+is not yet wired into the MCP ask/follow-up tools; they continue to use the
+existing CLI runner.
+
+Run `npm run benchmark:sdk` to compare one short CLI conversation with one warm
+SDK conversation. It uses the isolated Claude login and consumes subscription
+usage or API credits according to that profile's authentication. Results include
+initialization, first text, total turn time, and sampled process memory. The
+benchmark defaults to the `haiku` alias; set `CLAUDE_BENCHMARK_MODEL` to override.
+Its workload disables tools and MCP servers to limit side effects.
+
+The prototype reads `sdk_idle_timeout_sec` from the bridge config file. It defaults
+to 300 seconds and must be an integer from 1 to 86400. The process closes after
+that much idle time; active turns have their own timeout. For example:
+
+```json
+{ "sdk_idle_timeout_sec": 120 }
+```
+
+This setting currently applies to the benchmark prototype only, not to MCP tool
+calls. The prototype still needs session locking, configuration refresh, process
+cleanup and feature-parity validation before it can replace the existing runner.
+
 ```sh
 npm test
 ```
