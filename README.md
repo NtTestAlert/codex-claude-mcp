@@ -175,18 +175,17 @@ with `{ "message": "Inline card test" }` to test rendering without starting
 Claude or making a model call. Success means an inline Claude card appears and
 shows its prompt and output in the chat. The probe also returns the client's advertised
 `io.modelcontextprotocol/ui` capability (or `null` if absent); that report alone
-does not prove rendering. Protocol and script tests use simulated hosts and do
-not establish Codex desktop support. Desktop rendering remains unverified until
-the updated server is loaded and the card is observed in that client.
+does not prove rendering. The inline card has been observed working in Codex
+desktop; protocol and script tests also exercise simulated hosts.
 
 The interactive start returns before Claude finishes, so the host can render its
 card while the run is in progress. The bridge captures partial text events in a
 bounded in-memory buffer, and the card polls by run ID when the host permits UI
 tool calls. If polling is unavailable, `claude_wait` still returns the final
 result. The blocking tools also attempt live polling when the host provides their
-request ID and renders the card before completion. Whether Codex desktop renders
-and updates the interactive card has not been verified. Optional
-host widget state preserves expansion and scroll preferences when supported;
+request ID and renders the card before completion. The interactive card has been
+observed updating during a run in Codex desktop. Optional host widget state
+preserves expansion and scroll preferences when supported;
 the host controls whether cards are recreated and whether its own tool row
 collapses.
 
