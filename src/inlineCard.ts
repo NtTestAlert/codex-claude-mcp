@@ -29,6 +29,7 @@ export const cardHtml = String.raw`<!doctype html>
     .output { height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px; background: var(--color-background-secondary, ButtonFace); border-radius: 5px; }
     .details { margin-top: 10px; }
     .cost { float: right; color: var(--color-text-secondary, GrayText); font-weight: 400; font-variant-numeric: tabular-nums; }
+    .request-cost { opacity: 0.7; margin-right: 8px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 220px; font: 12px/1.5 ui-monospace, monospace; }
     [hidden] { display: none !important; }
   </style>
@@ -42,14 +43,14 @@ export const cardHtml = String.raw`<!doctype html>
     <button id="prompt-toggle" type="button" hidden>Show more</button>
     <div class="label">Output</div>
     <div id="output" class="output" tabindex="0" aria-label="Claude output">Waiting for Claude…</div>
-    <details id="details" class="details"><summary>Details <span id="cost" class="cost" hidden></span></summary><pre id="json">Waiting for result…</pre></details>
+    <details id="details" class="details"><summary>Details <span class="cost"><span id="request-cost" class="request-cost" hidden></span><span id="cost" hidden></span></span></summary><pre id="json">Waiting for result…</pre></details>
   </div>
   <script>
     (() => {
       const el = id => document.getElementById(id);
       const prompt = el('prompt'), promptToggle = el('prompt-toggle');
       const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
-      const cost = el('cost');
+      const cost = el('cost'), requestCost = el('request-cost');
       const quota = el('quota');
       const initId = 'claude-inspector-init';
       let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
@@ -61,6 +62,11 @@ export const cardHtml = String.raw`<!doctype html>
         const value = result?.total_cost_usd;
         cost.hidden = typeof value !== 'number' || !Number.isFinite(value) || value < 0;
         cost.textContent = cost.hidden ? '' : '$' + value.toFixed(3);
+        cost.title = 'Session total';
+        const request = result?.request_cost_usd;
+        requestCost.hidden = cost.hidden || typeof request !== 'number' || !Number.isFinite(request) || request < 0;
+        requestCost.textContent = requestCost.hidden ? '' : '$' + request.toFixed(3);
+        requestCost.title = 'This request';
       };
       const resize = () => {
         if (!ready) return;

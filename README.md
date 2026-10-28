@@ -131,9 +131,10 @@ are retained. For CLI, non-interactive sessions, or hosts without MCP Apps, use
 `claude_ask` and `claude_followup` directly.
 
 Results contain `session_id`, `answer`, `duration_sec`, `warnings`, `activity`,
-and, when applicable, `error`, `answer_file`, `total_cost_usd`, and token `usage`
+and, when applicable, `error`, `answer_file`, `total_cost_usd`, `request_cost_usd`, and token `usage`
 reported by Claude. Cost and usage are omitted when Claude does not provide them;
-they are not estimated. Errors are also MCP tool errors.
+they are not estimated. Request cost is the difference between Claude's reported session totals;
+it is omitted when a reliable previous total is unavailable. Errors are also MCP tool errors.
 Interrupted calls retain their bridge ID, but resuming is possible only if Claude
 created its underlying transcript before interruption. Long answers are retained
 in a temporary file; callers are responsible for removing retained answer files.
@@ -161,7 +162,8 @@ The conversation and interactive start tools reference an MCP Apps resource at
 `ui://claude/inspector.html`. In hosts that render MCP Apps from this connection,
 it displays an inline card with the prompt, a scrollable output area, and
 expandable JSON details. Long prompts can be expanded beyond three lines. The
-card follows new output while scrolled to the bottom and pauses following when
+details summary shows the request cost in muted text to the left of the session
+total when available. The card follows new output while scrolled to the bottom and pauses following when
 the user scrolls up. The card keeps its contents visible whenever the host
 displays it; the host controls the outer tool-call row and when it opens or
 closes. The card advertises only the inline display mode. Its HTML, CSS, and

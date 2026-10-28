@@ -40,6 +40,7 @@ if (prompt === '__generic_failure__' || prompt === '__authentication_failure__')
   process.exitCode = 1;
 } else {
   console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, is_error: false, result: JSON.stringify(request),
-    total_cost_usd: 0.0123, usage: { input_tokens: 123, output_tokens: 45, cache_read_input_tokens: 7 } }));
+    ...(prompt === '__no_cost__' ? {} : { total_cost_usd: prompt === 'Follow up' ? 0.0323 : prompt === 'After restart' ? 0.0423 : 0.0123 }),
+    usage: { input_tokens: 123, output_tokens: 45, cache_read_input_tokens: 7 } }));
 }
 }

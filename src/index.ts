@@ -104,8 +104,9 @@ async function invoke(input: Input, extra: Extra, live?: ReturnType<typeof start
           '--settings', config.settingsPath,
           ...(input.session_id ? [`--resume=${sessionId}`] : [`--session-id=${sessionId}`]),
           ...(model ? [`--model=${model}`] : []), ...(effort ? [`--effort=${effort}`] : [])];
-        // Save ownership before starting: a timeout or interrupted turn can still be resumed.
-        await writeSession(home, { ...info, model, effort });
+        // Clear the cost baseline before launching: an interrupted turn may have incurred unknown costs.
+        // Save ownership before starting so the conversation can still be resumed.
+        await writeSession(home, { ...info, model, effort, total_cost_usd: undefined });
         const token = extra._meta?.progressToken;
         const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: home };
         // Parent Claude nesting markers must not make this independently spawned session look nested.
@@ -120,11 +121,16 @@ async function invoke(input: Input, extra: Extra, live?: ReturnType<typeof start
               progress: Math.max(1, Math.round(elapsedSec)), message: `Claude running for ${Math.round(elapsedSec)}s${lastEvent ? ` (${lastEvent})` : ''}` } }).catch(() => {});
           } });
         keep = Boolean(run.answerFile);
+        const previousCost = input.session_id ? info.total_cost_usd : 0;
+        const requestCost = run.totalCostUsd !== undefined && previousCost !== undefined && run.totalCostUsd >= previousCost
+          ? run.totalCostUsd - previousCost : undefined;
+        await writeSession(home, { ...info, model, effort, total_cost_usd: run.totalCostUsd });
         return result({ session_id: sessionId, answer: run.answer, duration_sec: run.durationSec,
           warnings: [...config.warnings, ...run.warnings,
             ...(model && requestedModel && model !== requestedModel ? [`Model ${requestedModel} resolved to ${model} from the discovered catalogue.`] : [])], activity: run.activity,
           ...(run.answerFile ? { answer_file: run.answerFile } : {}),
           ...(run.totalCostUsd === undefined ? {} : { total_cost_usd: run.totalCostUsd }),
+          ...(requestCost === undefined ? {} : { request_cost_usd: requestCost }),
           ...(run.usage ? { usage: run.usage } : {}),
           ...(run.error ? { error: `${run.error}${run.stderrTail ? `\n${run.stderrTail}` : ''}${
             /not logged in|invalid api.?key|authentication[_ ](?:failed|error)|oauth token.*(?:expired|invalid)|please run.*\/login/i.test(`${run.error}\n${run.stderrTail}`)

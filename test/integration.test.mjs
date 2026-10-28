@@ -12,7 +12,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-test('MCP ask, follow-up, and restart preserve isolated conversation ownership', { timeout: 30000 }, async t => {
+test('MCP ask, follow-up, and restart preserve isolated conversation ownership', { timeout: 45000 }, async t => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-integration-'));
   const home = path.join(temp, 'isolated');
   const source = path.join(temp, 'primary');
@@ -108,6 +108,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   }
   const ask = await call(client, 'claude_ask', { prompt, cwd: project, model: 'sonnet', effort: 'high', permission_mode: 'acceptEdits', allowed_tools: allowedTools });
   assert.equal(ask.response.isError, false, ask.parsed.error);
+  assert.equal(ask.parsed.request_cost_usd, 0.0123);
   assert.equal(ask.response._meta.bridgeInput.prompt, prompt);
   assert.equal(ask.response._meta.bridgeInput.cwd, project);
   const id = ask.parsed.session_id;
@@ -132,6 +133,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
 
   const follow = await call(client, 'claude_followup', { prompt: 'Follow up', session_id: id, model: 'opus', effort: 'low' });
   assert.equal(follow.response.isError, false, follow.parsed.error);
+  assert.ok(Math.abs(follow.parsed.request_cost_usd - 0.02) < 1e-10);
   assert.equal(follow.response._meta.bridgeInput.prompt, 'Follow up');
   assert.equal(follow.response._meta.bridgeInput.session_id, id);
   const second = JSON.parse(follow.parsed.answer);
@@ -154,6 +156,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   client = await connect();
   const resumed = await call(client, 'claude_followup', { prompt: 'After restart', session_id: id });
   assert.equal(resumed.response.isError, false, resumed.parsed.error);
+  assert.ok(Math.abs(resumed.parsed.request_cost_usd - 0.01) < 1e-10);
   const third = JSON.parse(resumed.parsed.answer);
   assert.equal(third.session, id);
   assert.equal(third.cwd, project);
@@ -163,6 +166,15 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.equal(third.args[third.args.indexOf('--permission-mode') + 1], 'acceptEdits');
   assertAllowedTools(third.args);
   assert.equal((await fs.readFile(log, 'utf8')).trim().split('\n').length, 3);
+
+  const lower = await call(client, 'claude_followup', { prompt: 'lower reported total', session_id: id });
+  assert.equal(lower.parsed.request_cost_usd, undefined);
+  const noCost = await call(client, 'claude_followup', { prompt: '__no_cost__', session_id: id });
+  assert.equal(noCost.parsed.request_cost_usd, undefined);
+  const afterNoCost = await call(client, 'claude_followup', { prompt: 'after missing total', session_id: id });
+  assert.equal(afterNoCost.parsed.request_cost_usd, undefined);
+  const afterBaseline = await call(client, 'claude_followup', { prompt: 'after baseline restored', session_id: id });
+  assert.equal(afterBaseline.parsed.request_cost_usd, 0);
 
   // The default and explicit modes reach Claude unchanged; omitted allow rules grant nothing implicitly.
   for (const permissionMode of [undefined, 'manual', 'auto', 'default']) {

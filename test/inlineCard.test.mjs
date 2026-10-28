@@ -11,7 +11,7 @@ import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 function harness(host = {}) {
   const sent = [], listeners = new Map(), timers = new Map();
   let timerId = 0, disconnected = false;
-  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'quota'].map(id => {
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota'].map(id => {
     const handlers = new Map();
     return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
@@ -175,6 +175,18 @@ test('card displays zero cost and hides invalid cost in a final result', () => {
     h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { answer: 'done', total_cost_usd: value } } });
     assert.equal(h.elements.cost.textContent, expected);
     assert.equal(h.elements.cost.hidden, expected === '');
+  }
+});
+
+test('card shows request cost beside the session total only when both are available', () => {
+  for (const [request, total, expected] of [[0.0048, 0.025, '$0.005'], [0, 0.01, '$0.000'], [undefined, 0.01, ''], [-1, 0.01, ''], [0.01, undefined, '']]) {
+    const h = harness();
+    h.initialize();
+    h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { answer: 'done', total_cost_usd: total, request_cost_usd: request } } });
+    assert.equal(h.elements['request-cost'].textContent, expected);
+    assert.equal(h.elements['request-cost'].hidden, expected === '');
+    assert.equal(h.elements['request-cost'].title, 'This request');
+    assert.equal(h.elements.cost.title, 'Session total');
   }
 });
 
