@@ -307,13 +307,28 @@ server.registerTool('claude_list_models', {
   const current = refresh ? await refreshModels() : currentCatalog();
   return { content: [{ type: 'text', text: JSON.stringify(current, null, 2) }], structuredContent: { ...current } };
 });
+let cachedQuota: Awaited<ReturnType<typeof getQuota>> | undefined;
+let cachedQuotaUntil = 0;
+let quotaRequest: Promise<Awaited<ReturnType<typeof getQuota>>> | undefined;
+async function readQuota() {
+  if (cachedQuota && Date.now() < cachedQuotaUntil) return cachedQuota;
+  if (quotaRequest) return quotaRequest;
+  const pending = (async () => {
+    const quota = await getQuota(await ensureHome());
+    cachedQuota = quota;
+    cachedQuotaUntil = Date.now() + (quota.status === 'available' ? 60_000 : 15_000);
+    return quota;
+  })();
+  quotaRequest = pending;
+  try { return await pending; } finally { if (quotaRequest === pending) quotaRequest = undefined; }
+}
 server.registerTool('claude_get_quota', {
   title: 'Get Claude subscription quota',
-  description: 'Read the isolated Claude subscription account’s reported five-hour and weekly usage percentages and reset times. Returns unavailable when the subscription login or usage service does not provide them. Uses an undocumented Claude usage endpoint; does not report API-key rate limits.',
+  description: 'Read the isolated Claude subscription account’s reported five-hour and weekly usage percentages and reset times. Successful results may be cached for 60 seconds. Returns unavailable when the subscription login or usage service does not provide them. Uses an undocumented Claude usage endpoint; does not report API-key rate limits.',
   inputSchema: {},
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 }, async () => {
-  const quota = await getQuota(await ensureHome());
+  const quota = await readQuota();
   return { content: [{ type: 'text' as const, text: JSON.stringify(quota, null, 2) }], structuredContent: quota };
 });
 let refreshTimer: NodeJS.Timeout | undefined;

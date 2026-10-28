@@ -114,6 +114,9 @@ undocumented usage endpoint. It returns `status: "unavailable"` when credentials
 both usage windows, or the endpoint are unavailable; missing individual windows
 are `null`. It does not refresh credentials or query API-key rate limits. The
 endpoint may change or return rate-limit errors independently of model calls.
+Results are cached for up to 60 seconds (15 seconds on failure). The inline card
+requests a quota snapshot when it opens and after completion, if the host permits app tool calls, and
+shows the reported usage and local reset times.
 
 For an interactive session whose host supports MCP Apps, use `claude_start` to
 start either a new conversation (`cwd`) or a follow-up (`session_id`), then

@@ -80,6 +80,8 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   const quota = await call(client, 'claude_get_quota', {});
   assert.equal(quota.parsed.status, 'unavailable');
   assert.equal(quota.parsed.five_hour, null);
+  const cachedQuota = await call(client, 'claude_get_quota', {});
+  assert.equal(cachedQuota.parsed.checked_at, quota.parsed.checked_at);
   assert.equal(modelList.parsed.models[0].value, 'haiku');
   assert.equal(modelList.parsed.models[0].resolved_model, 'claude-haiku-5-5');
   const refreshedList = await call(client, 'claude_list_models', { refresh: true });

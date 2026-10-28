@@ -11,7 +11,7 @@ import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 function harness(host = {}) {
   const sent = [], listeners = new Map(), timers = new Map();
   let timerId = 0, disconnected = false;
-  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost'].map(id => {
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'quota'].map(id => {
     const handlers = new Map();
     return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
@@ -60,6 +60,43 @@ test('card displays prompt and output without an inner collapsed wrapper and ret
   h.receive({ id: 7, method: 'ui/resource-teardown' });
   assert.equal(h.sent.at(-1).id, 7);
   assert.equal(h.disconnected(), true);
+});
+
+test('card loads quota independently of live output and formats both reset times', () => {
+  const h = harness({ capabilities: { serverTools: {} }, context: { locale: 'en-US', timeZone: 'UTC' } });
+  h.initialize();
+  const request = h.sent.find(message => message.params?.name === 'claude_get_quota');
+  assert.ok(request);
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello' } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  h.receive({ id: request.id, result: { structuredContent: { status: 'available', checked_at: '2026-10-28T00:00:00Z',
+    five_hour: { used_percent: 19, resets_at: '2026-10-28T02:00:00Z' },
+    seven_day: { used_percent: 30, resets_at: '2026-11-02T14:00:00Z' } } } });
+  assert.equal(h.elements.quota.hidden, false);
+  assert.match(h.elements.quota.textContent, /5h: 19% used, resets Oct 28, 2026/);
+  assert.match(h.elements.quota.textContent, /Weekly: 30% used, resets Nov 2, 2026/);
+  assert.match(h.elements.quota.title, /2026-10-28/);
+  assert.equal(h.elements.status.textContent, 'Running');
+  h.tick(700);
+  const poll = h.sent.at(-1);
+  assert.equal(poll.params.name, 'claude_run_status');
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, status: 'completed', text: '', next_offset: 0, result: { answer: 'done' } } } });
+  assert.equal(h.sent.filter(message => message.params?.name === 'claude_get_quota').length, 2);
+});
+
+test('quota failures and missing values do not affect the card', () => {
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  const request = h.sent.find(message => message.params?.name === 'claude_get_quota');
+  h.receive({ id: request.id, error: { code: -32601, message: 'Unsupported' } });
+  assert.equal(h.elements.quota.textContent, 'Quota unavailable');
+  const second = harness({ capabilities: { serverTools: {} } });
+  second.initialize();
+  const secondRequest = second.sent.find(message => message.params?.name === 'claude_get_quota');
+  second.receive({ id: secondRequest.id, result: { structuredContent: { status: 'available', five_hour: null,
+    seven_day: { used_percent: null, resets_at: null } } } });
+  assert.match(second.elements.quota.textContent, /5h: unavailable/);
+  assert.match(second.elements.quota.textContent, /Weekly: usage unavailable, reset unavailable/);
 });
 
 test('card polls incremental output and stops on completion; user scrolling pauses following', () => {

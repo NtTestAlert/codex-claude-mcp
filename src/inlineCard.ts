@@ -20,6 +20,7 @@ export const cardHtml = String.raw`<!doctype html>
     summary, button { cursor: pointer; }
     summary { font-weight: 600; }
     .state { color: var(--color-text-secondary, GrayText); font-weight: 400; font-size: 12px; margin-left: 8px; }
+    .quota { color: var(--color-text-secondary, GrayText); font-size: 12px; margin: 4px 0; overflow-wrap: anywhere; }
     .label { font-weight: 600; margin: 10px 0 4px; }
     .prompt { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5em; }
     .prompt.clamped { max-height: 4.5em; overflow: hidden; }
@@ -35,6 +36,7 @@ export const cardHtml = String.raw`<!doctype html>
 <body>
   <div id="card">
     <div class="state" id="status" role="status">Connecting…</div>
+    <div id="quota" class="quota" hidden></div>
     <div class="label">Prompt</div>
     <div id="prompt" class="prompt clamped">Waiting for input…</div>
     <button id="prompt-toggle" type="button" hidden>Show more</button>
@@ -48,9 +50,10 @@ export const cardHtml = String.raw`<!doctype html>
       const prompt = el('prompt'), promptToggle = el('prompt-toggle');
       const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
       const cost = el('cost');
+      const quota = el('quota');
       const initId = 'claude-inspector-init';
       let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
-      let polling = false, timer, pollRequest, requestSeq = 0, follow = true;
+      let polling = false, timer, pollRequest, quotaRequest, requestSeq = 0, follow = true, hostContext;
       let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
       const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
       const format = value => JSON.stringify(value, null, 2);
@@ -67,7 +70,35 @@ export const cardHtml = String.raw`<!doctype html>
         if (size !== lastSize) { lastSize = size; send({ method: 'ui/notifications/size-changed', params: { width, height } }); }
       };
       const context = value => {
+        hostContext = { ...hostContext, ...value };
         if (value?.theme === 'light' || value?.theme === 'dark') document.documentElement.style.colorScheme = value.theme;
+      };
+      const showQuota = data => {
+        const describe = (label, value) => {
+          if (!value) return label + ': unavailable';
+          const used = typeof value.used_percent === 'number' && Number.isFinite(value.used_percent)
+            ? value.used_percent.toLocaleString(undefined, { maximumFractionDigits: 1 }) + '% used' : 'usage unavailable';
+          let reset = 'reset unavailable';
+          if (typeof value.resets_at === 'string') {
+            const date = new Date(value.resets_at);
+            if (Number.isFinite(date.getTime())) {
+              try { reset = 'resets ' + new Intl.DateTimeFormat(hostContext?.locale, { dateStyle: 'medium', timeStyle: 'short', timeZone: hostContext?.timeZone }).format(date); }
+              catch { reset = 'resets ' + date.toLocaleString(); }
+            }
+          }
+          return label + ': ' + used + ', ' + reset;
+        };
+        quota.textContent = data?.status === 'available'
+          ? describe('5h', data.five_hour) + ' · ' + describe('Weekly', data.seven_day)
+          : 'Quota unavailable';
+        if (data?.checked_at) quota.title = 'Quota checked at ' + data.checked_at;
+        quota.hidden = false;
+        resize();
+      };
+      const requestQuota = () => {
+        if (!canCallTools || quotaRequest) return;
+        quotaRequest = 'claude-quota-' + (++requestSeq);
+        send({ id: quotaRequest, method: 'tools/call', params: { name: 'claude_get_quota', arguments: {} } });
       };
       const persist = () => {
         try { window.openai?.setWidgetState?.({ detailsOpen: detail.open, promptExpanded, follow, scrollTop: restoredScrollTop ?? output.scrollTop }); } catch { /* optional host API */ }
@@ -130,11 +161,20 @@ export const cardHtml = String.raw`<!doctype html>
           canCallTools = Boolean(message.result.hostCapabilities?.serverTools);
           polling = callId !== undefined && canCallTools;
           send({ method: 'ui/notifications/initialized', params: {} });
+          requestQuota();
           status.textContent = 'Waiting for input';
           if (typeof ResizeObserver !== 'undefined') { observer = new ResizeObserver(() => { showPrompt(input?.prompt); resize(); }); observer.observe(document.body); }
           resize(); return;
         }
         if (!ready) return;
+        if (quotaRequest && message.id === quotaRequest && !message.method) {
+          quotaRequest = undefined;
+          const response = message.result;
+          let data = response?.structuredContent;
+          if (!data && response?.content?.[0]?.type === 'text') { try { data = JSON.parse(response.content[0].text); } catch {} }
+          showQuota(message.error || response?.isError ? undefined : data);
+          return;
+        }
         if (pollRequest && message.id === pollRequest && !message.method) {
           clearTimeout(timer); pollRequest = undefined;
           if (finished) return;
@@ -152,6 +192,7 @@ export const cardHtml = String.raw`<!doctype html>
               const result = data.result ?? {};
               json.textContent = format({ input, result });
               showCost(result);
+              requestQuota();
               setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
               status.textContent = data.status === 'failed' ? 'Failed' : 'Complete';
               save(); resize(); return;
@@ -189,6 +230,7 @@ export const cardHtml = String.raw`<!doctype html>
             finished = true; stopPolling();
             json.textContent = format({ input, result });
             showCost(result);
+            requestQuota();
             const failed = params.isError || result?.error;
             setOutput(typeof result?.answer === 'string' && result.answer ? result.answer : (result?.error || 'No output'), false);
             status.textContent = failed ? 'Failed' : 'Complete';
