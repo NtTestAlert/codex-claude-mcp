@@ -40,6 +40,7 @@ export const cardHtml = String.raw`<!doctype html>
   <div id="card">
     <div><span class="state" id="status" role="status">Connecting…</span><button id="cancel" class="cancel" type="button" hidden>Cancel</button></div>
     <div id="run-info" class="run-info" hidden></div>
+    <div id="notification" class="run-info" role="status" hidden></div>
     <div id="quota" class="quota" hidden></div>
     <div class="label">Prompt</div>
     <div id="prompt" class="prompt clamped">Waiting for input…</div>
@@ -55,10 +56,11 @@ export const cardHtml = String.raw`<!doctype html>
       const output = el('output'), detail = el('details'), json = el('json'), status = el('status');
       const cost = el('cost'), requestCost = el('request-cost');
       const quota = el('quota');
-      const cancel = el('cancel'), runInfo = el('run-info');
+      const cancel = el('cancel'), runInfo = el('run-info'), notification = el('notification');
       const initId = 'claude-inspector-init';
       let ready = false, finished = false, observer, lastSize = '', callId, runId, input, offset = 0, canCallTools = false;
-      let polling = false, timer, pollRequest, quotaRequest, cancelRequest, cancelTimer, requestSeq = 0, follow = true, hostContext;
+      let polling = false, timer, pollRequest, quotaRequest, cancelRequest, cancelTimer, messageRequest, messageTimer, requestSeq = 0, follow = true, hostContext;
+      let canNotify = false, backgroundMode = false;
       let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
       let lastModel, lastEffort;
       const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
@@ -87,6 +89,15 @@ export const cardHtml = String.raw`<!doctype html>
         runInfo.textContent = parts.join(' · '); runInfo.hidden = false;
       };
       const hideCancel = () => { cancel.hidden = true; cancel.disabled = false; clearTimeout(cancelTimer); cancelRequest = undefined; };
+      const showNotification = text => { notification.textContent = text; notification.hidden = false; resize(); };
+      const notifyCompletion = (id, state) => {
+        messageRequest = 'claude-message-' + (++requestSeq);
+        const outcome = state === 'cancelled' ? 'cancelled' : state === 'failed' ? 'failed' : 'completed';
+        send({ id: messageRequest, method: 'ui/message', params: { role: 'user', content: [{ type: 'text',
+          text: 'Claude background run ' + outcome + ' (run_id: ' + id + '). Call claude_wait with this run_id to retrieve the result.' }] } });
+        showNotification('Sending completion notification…');
+        messageTimer = setTimeout(() => { if (messageRequest) { messageRequest = undefined; showNotification('Notification not confirmed; use claude_wait to retrieve the result.'); } }, 5000);
+      };
       const resize = () => {
         if (!ready) return;
         const width = Math.ceil(document.documentElement.clientWidth);
@@ -176,12 +187,13 @@ export const cardHtml = String.raw`<!doctype html>
       const poll = () => {
         if (!polling || finished || !input || (runId === undefined && callId === undefined)) return;
         pollRequest = 'claude-live-' + (++requestSeq);
-        const args = runId !== undefined ? { run_id: runId, offset } : {
+        const args = runId !== undefined ? { run_id: runId, offset, ...(backgroundMode && canNotify ? { claim_notification: true } : {}) } : {
           request_id: callId, prompt: input.prompt, ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
           ...(input.session_id === undefined ? {} : { session_id: input.session_id }), offset,
         };
         send({ id: pollRequest, method: 'tools/call', params: { name: runId !== undefined ? 'claude_run_status' : 'claude_ui_status', arguments: args } });
-        timer = setTimeout(() => { if (pollRequest) { stopPolling(); status.textContent = 'Running · live output unavailable'; } }, 5000);
+        timer = setTimeout(() => { if (pollRequest) { stopPolling(); status.textContent = 'Running · live output unavailable';
+          if (backgroundMode) showNotification('Live status unavailable; use claude_wait to retrieve the result.'); } }, 5000);
       };
       const timeout = setTimeout(() => { if (!ready) status.textContent = 'Host did not initialize card'; }, 5000);
       const receive = event => {
@@ -195,6 +207,12 @@ export const cardHtml = String.raw`<!doctype html>
           ready = true; context(message.result.hostContext); restore();
           callId = message.result.hostContext?.toolInfo?.id;
           canCallTools = Boolean(message.result.hostCapabilities?.serverTools);
+          // The 2026-01-26 host capabilities did not advertise ui/message.
+          // Try it for that legacy version unless the host explicitly lists modalities without text.
+          const messageCapability = message.result.hostCapabilities?.message;
+          canNotify = messageCapability === undefined
+            ? message.result.protocolVersion === '2026-01-26'
+            : Boolean(messageCapability?.text);
           polling = callId !== undefined && canCallTools;
           send({ method: 'ui/notifications/initialized', params: {} });
           requestQuota();
@@ -203,6 +221,12 @@ export const cardHtml = String.raw`<!doctype html>
           resize(); return;
         }
         if (!ready) return;
+        if (messageRequest && message.id === messageRequest && !message.method) {
+          clearTimeout(messageTimer); messageRequest = undefined;
+          if (message.error || !message.result || message.result.isError) showNotification('Notification rejected; use claude_wait to retrieve the result.');
+          else showNotification('Completion notification sent; use claude_wait if no follow-up occurs.');
+          return;
+        }
         if (cancelRequest && message.id === cancelRequest && !message.method) {
           clearTimeout(cancelTimer); cancelRequest = undefined;
           if (finished) return;
@@ -225,7 +249,8 @@ export const cardHtml = String.raw`<!doctype html>
           const response = message.result;
           let data = response?.structuredContent;
           if (!data && response?.content?.[0]?.type === 'text') { try { data = JSON.parse(response.content[0].text); } catch {} }
-          if (message.error || response?.isError) { stopPolling(); status.textContent = 'Running · live output unavailable'; return; }
+          if (message.error || response?.isError) { stopPolling(); status.textContent = 'Running · live output unavailable';
+            if (backgroundMode) showNotification('Live status unavailable; use claude_wait to retrieve the result.'); return; }
           if (data?.available) {
             missingPolls = 0;
             showRunInfo(data);
@@ -242,10 +267,13 @@ export const cardHtml = String.raw`<!doctype html>
               requestQuota();
               setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
               status.textContent = data.status === 'cancelled' ? 'Cancelled' : data.status === 'failed' ? 'Failed' : 'Complete';
+              if (data.notification_claimed && runId && canNotify) notifyCompletion(runId, data.status);
+              else if (data.background) showNotification('Completion notification unavailable or already attempted; use claude_wait if needed.');
               save(); resize(); return;
             }
           } else if (++missingPolls >= 8) {
-            stopPolling(); status.textContent = 'Running · live output unavailable'; return;
+            stopPolling(); status.textContent = 'Running · live output unavailable';
+            if (backgroundMode) showNotification('Live status unavailable; use claude_wait to retrieve the result.'); return;
           }
           schedule(); return;
         }
@@ -268,8 +296,10 @@ export const cardHtml = String.raw`<!doctype html>
             if (typeof result?.run_id === 'string' && result.status === 'working') {
               if (finished || runId === result.run_id) break;
               stopPolling(); runId = result.run_id; offset = 0;
+              backgroundMode = result.background === true || input?.background === true;
               json.textContent = format({ input, start: result });
               polling = canCallTools;
+              if (backgroundMode && (!canNotify || !canCallTools)) showNotification('Background notification unavailable in this host; use claude_wait to retrieve the result.');
               cancel.hidden = !canCallTools; cancel.disabled = false; cancel.textContent = 'Cancel';
               showRunInfo({ model: input?.model, effort: input?.effort });
               status.textContent = polling ? 'Running' : 'Running · live output unavailable';
@@ -292,7 +322,7 @@ export const cardHtml = String.raw`<!doctype html>
           case 'ui/notifications/host-context-changed': context(params); break;
           case 'ping': if (message.id !== undefined) send({ id: message.id, result: {} }); break;
           case 'ui/resource-teardown':
-            stopPolling(); hideCancel(); clearTimeout(timeout); clearTimeout(widgetTimer); persist(); observer?.disconnect();
+            stopPolling(); hideCancel(); clearTimeout(timeout); clearTimeout(widgetTimer); clearTimeout(messageTimer); persist(); observer?.disconnect();
             window.removeEventListener('message', receive);
             if (message.id !== undefined) send({ id: message.id, result: {} }); return;
           default:

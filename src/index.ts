@@ -57,7 +57,7 @@ const common = {
   effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
   timeout_sec: z.number().int().min(10).max(3600).default(900),
 };
-type Input = { prompt: string; model?: string; effort?: string; timeout_sec: number; cwd?: string; session_id?: string; permission_mode?: typeof permissions[number]; allowed_tools?: string[] };
+type Input = { prompt: string; model?: string; effort?: string; timeout_sec: number; cwd?: string; session_id?: string; permission_mode?: typeof permissions[number]; allowed_tools?: string[]; background?: boolean };
 function result(out: Record<string, unknown>, input: Input) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(out, null, 2) }], structuredContent: out, isError: Boolean(out.error),
     _meta: { bridgeInput: input } };
@@ -165,10 +165,11 @@ const askShape = { ...common, model: modelParameter(), cwd: z.string().min(1),
 const followShape = { ...common, model: modelParameter(), session_id: z.string().uuid() };
 const startShape = { ...common, model: modelParameter(), cwd: z.string().min(1).optional(),
   session_id: z.string().uuid().optional(), permission_mode: z.enum(permissions).optional(),
-  allowed_tools: askShape.allowed_tools };
+  allowed_tools: askShape.allowed_tools,
+  background: z.boolean().default(false).describe('Request a completion message from the interactive card while you continue other work. Host support and delivery are not guaranteed; use claude_wait to retrieve the result.') };
 function createServer(uiEnabled: boolean) {
 const server = new McpServer({ name: 'codex-claude-mcp', version }, {
-  instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} Model catalogue at startup (may change; use current tool descriptions or claude_list_models for the latest): ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
+  instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For optional background work, pass background=true and continue other work; on a completion message call claude_wait with its run_id. Delivery requires a supported, live card and is not guaranteed; use claude_wait if no message arrives. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} Model catalogue at startup (may change; use current tool descriptions or claude_list_models for the latest): ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
 });
 function tracked(input: Input, extra: Extra) {
   const live = uiEnabled ? startLiveRun(extra.requestId, { prompt: input.prompt, cwd: input.cwd, session_id: input.session_id }) : undefined;
@@ -198,11 +199,12 @@ type InvokeResult = Awaited<ReturnType<typeof invoke>>;
 type InteractiveRun = {
   input: Input; controller: AbortController; promise: Promise<InvokeResult>;
   live: NonNullable<ReturnType<typeof startLiveRun>>; result?: InvokeResult; expiry?: NodeJS.Timeout;
+  notificationClaimed: boolean; waiters: number; resultDelivered: boolean;
 };
 const interactiveRuns = new Map<string, InteractiveRun>();
 const INTERACTIVE_RETENTION_MS = 30 * 60_000;
 const MAX_INTERACTIVE_RUNS = 64;
-const startDescription = 'For interactive MCP Apps sessions only: start a new Claude ask (cwd) or follow-up (session_id) and show a live card. Immediately returns run_id, not the answer. Call claude_wait with run_id to obtain the final answer. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Claude may edit files; no read-only sandbox is enforced.';
+const startDescription = 'For interactive MCP Apps sessions only: start a new Claude ask (cwd) or follow-up (session_id) and show a live card. Immediately returns run_id, not the answer. Normally call claude_wait for the final answer. Set background=true to continue other work and request a completion message; then call claude_wait when notified. Notifications depend on host support and a live card and may not arrive; use claude_wait as fallback. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Claude may edit files; no read-only sandbox is enforced.';
 const startTool = uiEnabled ? server.registerTool('claude_start', {
   title: 'Start Claude with live card', description: `${startDescription} ${modelGuidance(catalog)}`,
   inputSchema: startShape,
@@ -221,7 +223,7 @@ const startTool = uiEnabled ? server.registerTool('claude_start', {
   const controller = new AbortController();
   const extra: Extra = { signal: controller.signal, sendNotification: async () => {} };
   const execution = invoke(input, extra, live);
-  const run: InteractiveRun = { input, controller, live, promise: execution };
+  const run: InteractiveRun = { input, controller, live, promise: execution, notificationClaimed: false, waiters: 0, resultDelivered: false };
   interactiveRuns.set(runId, run);
   inflight.add(execution);
   void execution.then(response => {
@@ -230,14 +232,15 @@ const startTool = uiEnabled ? server.registerTool('claude_start', {
     run.expiry = setTimeout(() => { if (interactiveRuns.get(runId) === run) { interactiveRuns.delete(runId); live.close(); } }, INTERACTIVE_RETENTION_MS);
     run.expiry.unref();
   }).finally(() => inflight.delete(execution));
-  const data = { run_id: runId, status: 'working', instruction: 'This is not the final answer. Call claude_wait with run_id.' };
+  const data = { run_id: runId, status: 'working', background: input.background,
+    instruction: input.background ? 'This is not the final answer. Continue other work and call claude_wait with run_id on completion notification. Notification is not guaranteed; call claude_wait if needed.' : 'This is not the final answer. Call claude_wait with run_id.' };
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }], structuredContent: data,
     _meta: { bridgeInput: input } };
 }) : undefined;
 if (uiEnabled) {
 server.registerTool('claude_wait', {
   title: 'Wait for Claude',
-  description: 'For an interactive run started by claude_start, wait for and return the final Claude answer and session_id. Always call this after claude_start; the start response is not the answer. Cancelling this wait cancels the running Claude process. CLI and non-interactive sessions should use claude_ask or claude_followup instead.',
+  description: 'For an interactive run started by claude_start, wait for and return the final Claude answer and session_id. For a background run call this after the completion message, or as fallback if no message arrives; the start response is not the answer. Cancelling this wait cancels the running Claude process. CLI and non-interactive sessions should use claude_ask or claude_followup instead.',
   inputSchema: { run_id: z.string().uuid() },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 }, async ({ run_id }, extra) => {
@@ -246,7 +249,9 @@ server.registerTool('claude_wait', {
   const abort = () => run.controller.abort();
   extra.signal.addEventListener('abort', abort, { once: true });
   if (extra.signal.aborted) abort();
-  try { return await run.promise; } finally { extra.signal.removeEventListener('abort', abort); }
+  run.waiters++;
+  try { const result = await run.promise; run.resultDelivered = true; return result; }
+  finally { run.waiters--; extra.signal.removeEventListener('abort', abort); }
 });
 server.registerTool('claude_cancel', {
   title: 'Cancel Claude run', description: 'Cancel an active interactive run created by claude_start. Use claude_wait to retrieve its final cancellation result.',
@@ -261,13 +266,16 @@ server.registerTool('claude_cancel', {
 });
 server.registerTool('claude_run_status', {
   title: 'Read interactive Claude output', description: 'Read incremental output and completion status for an interactive run. Used by the live card.',
-  inputSchema: { run_id: z.string().uuid(), offset: z.number().int().min(0) },
+  inputSchema: { run_id: z.string().uuid(), offset: z.number().int().min(0), claim_notification: z.boolean().default(false) },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   _meta: { ui: { visibility: ['app'] } },
-}, async ({ run_id, offset }) => {
+}, async ({ run_id, offset, claim_notification }) => {
   const run = interactiveRuns.get(run_id);
   if (!run) return { content: [{ type: 'text' as const, text: JSON.stringify({ available: false }) }], structuredContent: { available: false } };
-  const data = { ...readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset),
+  const liveData = readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset);
+  const notify = Boolean(liveData.available && claim_notification && run.input.background && run.result && !run.notificationClaimed && !run.waiters && !run.resultDelivered);
+  if (notify) run.notificationClaimed = true;
+  const data = { ...liveData, background: Boolean(run.input.background), notification_claimed: notify,
     status: run.result ? (run.result.isError ? (run.controller.signal.aborted ? 'cancelled' : 'failed') : 'completed') : run.controller.signal.aborted ? 'cancelling' : 'working',
     ...(run.result ? { result: run.result.structuredContent } : {}) };
   return { content: [{ type: 'text' as const, text: JSON.stringify(data) }], structuredContent: data };

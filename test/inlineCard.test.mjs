@@ -11,7 +11,7 @@ import { MAX_ANSWER_CHARS } from '../dist/runner.js';
 function harness(host = {}) {
   const sent = [], listeners = new Map(), timers = new Map();
   let timerId = 0, disconnected = false;
-  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota', 'run-info', 'cancel'].map(id => {
+  const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota', 'run-info', 'cancel', 'notification'].map(id => {
     const handlers = new Map();
     return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
@@ -194,6 +194,53 @@ test('cancel is unavailable without host tool calls and can be retried after an 
   assert.equal(h.elements.cancel.disabled, false);
   assert.equal(h.elements.cancel.textContent, 'Retry cancel');
   assert.equal(h.elements.status.textContent, 'Cancellation failed');
+});
+
+test('background completion sends one message containing only the run ID and handles rejection', () => {
+  const h = harness({ capabilities: { serverTools: {}, message: { text: {} } } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'secret prompt', background: true } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id', background: true } } });
+  h.tick(700);
+  const poll = h.sent.at(-1);
+  assert.equal(poll.params.arguments.claim_notification, true);
+  h.receive({ id: poll.id, result: { structuredContent: { available: true, status: 'completed', background: true, notification_claimed: true,
+    text: '', next_offset: 0, result: { answer: 'private answer' } } } });
+  const message = h.sent.find(item => item.method === 'ui/message');
+  assert.equal(message.params.role, 'user');
+  assert.match(message.params.content[0].text, /run-id.*claude_wait/);
+  assert.doesNotMatch(message.params.content[0].text, /secret prompt|private answer/);
+  h.receive({ id: message.id, error: { code: -32601, message: 'Unsupported' } });
+  assert.match(h.elements.notification.textContent, /rejected.*claude_wait/);
+  h.tick(700);
+  assert.equal(h.sent.filter(item => item.method === 'ui/message').length, 1);
+});
+
+test('background mode falls back when host cannot send messages and accepts success responses', () => {
+  const noMessages = harness({ capabilities: { serverTools: {}, message: {} } });
+  noMessages.initialize();
+  noMessages.receive({ method: 'ui/notifications/tool-result', params: { _meta: { bridgeInput: { prompt: 'hello', background: true } },
+    structuredContent: { status: 'working', run_id: 'run-id', background: true } } });
+  assert.match(noMessages.elements.notification.textContent, /unavailable.*claude_wait/);
+  noMessages.tick(700);
+  assert.equal(noMessages.sent.at(-1).params.arguments.claim_notification, undefined);
+  const legacy = harness({ capabilities: { serverTools: {} } });
+  legacy.initialize();
+  legacy.receive({ method: 'ui/notifications/tool-result', params: { _meta: { bridgeInput: { prompt: 'hello', background: true } },
+    structuredContent: { status: 'working', run_id: 'run-id', background: true } } });
+  legacy.tick(700);
+  assert.equal(legacy.sent.at(-1).params.arguments.claim_notification, true);
+  const h = harness({ capabilities: { serverTools: {}, message: { text: {} } } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-result', params: { _meta: { bridgeInput: { prompt: 'hello', background: true } },
+    structuredContent: { status: 'working', run_id: 'run-id', background: true } } });
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'failed', background: true,
+    notification_claimed: true, text: '', next_offset: 0, result: { error: 'failed' } } } });
+  const message = h.sent.find(item => item.method === 'ui/message');
+  assert.match(message.params.content[0].text, /failed/);
+  h.receive({ id: message.id, result: {} });
+  assert.match(h.elements.notification.textContent, /sent/);
 });
 
 test('a recreated card retrieves the completed run and its details', () => {

@@ -276,6 +276,31 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.equal(cancelResult.isError, true);
   const cancelledStatus = await call(client, 'claude_run_status', { run_id: cancelStart.parsed.run_id, offset: 0 });
   assert.equal(cancelledStatus.parsed.status, 'cancelled');
+  const background = await call(client, 'claude_start', { prompt: '__live_output__', cwd: project, background: true });
+  assert.equal(background.parsed.background, true);
+  assert.match(background.parsed.instruction, /Continue other work/);
+  let backgroundStatus;
+  const backgroundDeadline = Date.now() + 10000;
+  while (Date.now() < backgroundDeadline) {
+    backgroundStatus = (await call(client, 'claude_run_status', { run_id: background.parsed.run_id, offset: 0, claim_notification: true })).parsed;
+    if (backgroundStatus.status === 'completed') break;
+    assert.equal(backgroundStatus.notification_claimed, false);
+    await delay(100);
+  }
+  assert.equal(backgroundStatus.status, 'completed');
+  assert.equal(backgroundStatus.notification_claimed, true);
+  const duplicate = await call(client, 'claude_run_status', { run_id: background.parsed.run_id, offset: 0, claim_notification: true });
+  assert.equal(duplicate.parsed.notification_claimed, false);
+  const backgroundResult = await call(client, 'claude_wait', { run_id: background.parsed.run_id });
+  assert.equal(backgroundResult.response.isError, false);
+  const foreground = await call(client, 'claude_start', { prompt: 'foreground', cwd: project });
+  await call(client, 'claude_wait', { run_id: foreground.parsed.run_id });
+  const foregroundStatus = await call(client, 'claude_run_status', { run_id: foreground.parsed.run_id, offset: 0, claim_notification: true });
+  assert.equal(foregroundStatus.parsed.notification_claimed, false);
+  const waitedBackground = await call(client, 'claude_start', { prompt: 'already waited', cwd: project, background: true });
+  await call(client, 'claude_wait', { run_id: waitedBackground.parsed.run_id });
+  const waitedStatus = await call(client, 'claude_run_status', { run_id: waitedBackground.parsed.run_id, offset: 0, claim_notification: true });
+  assert.equal(waitedStatus.parsed.notification_claimed, false);
 });
 
 test('startup config controls UI tools, resources, and guidance', { timeout: 30000 }, async t => {
