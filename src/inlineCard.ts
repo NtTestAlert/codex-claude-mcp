@@ -30,7 +30,7 @@ export const cardHtml = String.raw`<!doctype html>
     button:focus-visible, summary:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
     .output { height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px; background: var(--color-background-secondary, ButtonFace); border-radius: 5px; }
     .stream-entry + .stream-entry { margin-top: 8px; }
-    .stream-actions { color: var(--color-text-secondary, GrayText); font-size: 12px; }
+    .stream-actions { color: #102844; font-size: 12px; font-weight: 500; }
     .details { margin-top: 10px; }
     .cost { float: right; color: var(--color-text-secondary, GrayText); font-weight: 400; font-variant-numeric: tabular-nums; }
     .request-cost { opacity: 0.7; margin-right: 8px; }

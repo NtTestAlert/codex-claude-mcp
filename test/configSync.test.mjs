@@ -34,6 +34,22 @@ test('selective sync preserves isolated native state and excludes recursive alia
   assert.equal((await fs.readdir(target)).includes('history.jsonl'), false);
 });
 
+test('sync never copies or overwrites Claude profile login credentials', async t => {
+  const { source, target, put } = await fixture(t);
+  await put(source, '.credentials.json', { claudeAiOauth: { accessToken: 'source-login' } });
+  await put(target, '.credentials.json', { claudeAiOauth: { accessToken: 'review-login' } });
+  const targetCredentials = path.join(target, '.credentials.json');
+  const before = await fs.readFile(targetCredentials, 'utf8');
+  const output = await syncConfig(source, target);
+  await syncConfig(source, target);
+  assert.equal(await fs.readFile(targetCredentials, 'utf8'), before);
+  assert.doesNotMatch(await fs.readFile(output.settingsPath, 'utf8'), /source-login|review-login/);
+  assert.doesNotMatch(await fs.readFile(output.mcpConfigPath, 'utf8'), /source-login|review-login/);
+  await fs.rm(targetCredentials);
+  await syncConfig(source, target);
+  await assert.rejects(fs.stat(targetCredentials), { code: 'ENOENT' });
+});
+
 test('refresh removes deleted source entries and does not rewrite unchanged files', async t => {
   const { source, target, put, read } = await fixture(t);
   await put(source, '.claude.json', { mcpServers: { server: { command: 'test' } } });
