@@ -130,8 +130,10 @@ server process; completed results expire after 30 minutes and at most 64 runs
 are retained. For CLI, non-interactive sessions, or hosts without MCP Apps, use
 `claude_ask` and `claude_followup` directly.
 
-To let the calling model continue other work, `claude_start` also accepts
-`background: true`. When the run ends, the live card attempts to send a message
+Experimental background completion messages are disabled by default because
+Codex can queue them until they are no longer timely. To enable them, set
+`"background_notifications": true` in the bridge config and reconnect. Then
+`claude_start` accepts `background: true`. When the run ends, the live card attempts to send a message
 asking the model to call `claude_wait` for the result. This requires a host that
 supports app tool calls and text `ui/message`, and a live card. The host may
 reject the message, show it as a user message, or not start a model turn. A card
@@ -140,6 +142,8 @@ completed runs for 30 minutes. If no notification arrives, call `claude_wait`
 with the saved run ID. Delivery is attempted at most once per run; accepted
 messages are not a guarantee that a follow-up turn occurred. Foreground runs
 continue to use `claude_start` followed immediately by `claude_wait`.
+When notifications are disabled, `background: true` is rejected rather than
+starting a run that the model might never retrieve.
 
 Results contain `session_id`, `answer`, `duration_sec`, `warnings`, `activity`,
 and, when applicable, `error`, `answer_file`, `total_cost_usd`, `request_cost_usd`, and token `usage`
@@ -218,6 +222,11 @@ is terminated. Cleanup can take a few additional seconds. Codex's
 `tool_timeout_sec` is a separate outer deadline: 3700 seconds accommodates the
 bridge's maximum 3600-second run plus cleanup. Progress notifications give
 visibility; they are not assumed to extend Codex's deadline.
+
+`claude_wait` itself has no short polling timeout: it waits for the run's final
+result. If a host or tool wrapper yields a pending operation, keep waiting on
+that same operation using a long wait interval. The wrapper's yield interval is
+separate from the host's tool deadline and cannot be set by this MCP server.
 
 ## Configuration and isolation
 

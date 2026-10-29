@@ -20,12 +20,12 @@ import { discoverModels, modelGuidance, resolveModelShorthand, type ModelCatalog
 import { getQuota } from './quota.js';
 
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-async function readBridgeConfig(): Promise<{ uiMode: boolean | 'auto'; modelRefreshSec: number }> {
+async function readBridgeConfig(): Promise<{ uiMode: boolean | 'auto'; modelRefreshSec: number; backgroundNotifications: boolean }> {
   const configPath = path.join(claudeHomePath(), '.codex-claude-mcp', 'config.json');
   let raw: string;
   try { raw = await fs.readFile(configPath, 'utf8'); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { uiMode: 'auto', modelRefreshSec: 3600 };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { uiMode: 'auto', modelRefreshSec: 3600, backgroundNotifications: false };
     throw new Error(`Cannot read bridge config ${configPath}: ${(error as Error).message}`);
   }
   let config: unknown;
@@ -44,9 +44,11 @@ async function readBridgeConfig(): Promise<{ uiMode: boolean | 'auto'; modelRefr
   if (typeof interval !== 'number' || !Number.isSafeInteger(interval) || interval < 0 || interval > 86400) {
     throw new Error(`Bridge config ${configPath}: model_refresh_sec must be an integer from 0 to 86400`);
   }
-  return { uiMode, modelRefreshSec: interval };
+  const notifications = 'background_notifications' in config ? (config as { background_notifications?: unknown }).background_notifications : false;
+  if (typeof notifications !== 'boolean') throw new Error(`Bridge config ${configPath}: background_notifications must be true or false`);
+  return { uiMode, modelRefreshSec: interval, backgroundNotifications: notifications };
 }
-const { uiMode, modelRefreshSec } = await readBridgeConfig();
+const { uiMode, modelRefreshSec, backgroundNotifications } = await readBridgeConfig();
 const shutdown = new AbortController();
 const inflight = new Set<Promise<unknown>>();
 type Extra = { signal: AbortSignal; requestId?: string | number; _meta?: { progressToken?: string | number }; sendNotification(n: any): Promise<void> };
@@ -167,10 +169,10 @@ const followShape = { ...common, model: modelParameter(), session_id: z.string()
 const startShape = { ...common, model: modelParameter(), cwd: z.string().min(1).optional(),
   session_id: z.string().uuid().optional(), permission_mode: z.enum(permissions).optional(),
   allowed_tools: askShape.allowed_tools,
-  background: z.boolean().default(false).describe('Request a completion message from the interactive card while you continue other work. Host support and delivery are not guaranteed; use claude_wait to retrieve the result.') };
+  background: z.boolean().default(false).describe(backgroundNotifications ? 'Experimental: request a completion message while continuing other work, only when explicitly requested. Messages may be queued and arrive late; use claude_wait to retrieve the result.' : 'Background completion messages are disabled by configuration; leave false and use claude_wait.') };
 function createServer(uiEnabled: boolean) {
 const server = new McpServer({ name: 'codex-claude-mcp', version }, {
-  instructions: `${uiEnabled ? 'For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. For optional background work, pass background=true and continue other work; on a completion message call claude_wait with its run_id. Delivery requires a supported, live card and is not guaranteed; use claude_wait if no message arrives. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.' : 'Use claude_ask to start a conversation and claude_followup to continue it.'} Model catalogue at startup (may change; use current tool descriptions or claude_list_models for the latest): ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
+  instructions: `${uiEnabled ? `For interactive sessions with an MCP Apps card, use claude_start then claude_wait for the final answer; start supports both new asks and follow-ups. ${backgroundNotifications ? 'Background completion messages are experimental and may be queued and arrive late; use background=true only when explicitly requested, then call claude_wait when notified or as a fallback. ' : ''}For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Never treat the start acknowledgement as the answer.` : 'Use claude_ask to start a conversation and claude_followup to continue it.'} Model catalogue at startup (may change; use current tool descriptions or claude_list_models for the latest): ${modelGuidance(catalog)} Save the session_id for follow-ups. Claude may edit files; this bridge does not enforce read-only access. Do not recursively delegate back through another bridge.`,
 });
 function tracked(input: Input, extra: Extra) {
   const live = uiEnabled ? startLiveRun(extra.requestId, { prompt: input.prompt, cwd: input.cwd, session_id: input.session_id }) : undefined;
@@ -205,7 +207,7 @@ type InteractiveRun = {
 const interactiveRuns = new Map<string, InteractiveRun>();
 const INTERACTIVE_RETENTION_MS = 30 * 60_000;
 const MAX_INTERACTIVE_RUNS = 64;
-const startDescription = 'For interactive MCP Apps sessions only: start a new Claude ask (cwd) or follow-up (session_id) and show a live card. Immediately returns run_id, not the answer. Normally call claude_wait for the final answer. Set background=true to continue other work and request a completion message; then call claude_wait when notified. Notifications depend on host support and a live card and may not arrive; use claude_wait as fallback. For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Claude may edit files; no read-only sandbox is enforced.';
+const startDescription = `For interactive MCP Apps sessions only: start a new Claude ask (cwd) or follow-up (session_id) and show a live card. Immediately returns run_id, not the answer. Call claude_wait for the final answer. ${backgroundNotifications ? 'Experimental background notifications may be queued and arrive late; use only when explicitly requested and call claude_wait when notified or as fallback. ' : ''}For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly. Claude may edit files; no read-only sandbox is enforced.`;
 const startTool = uiEnabled ? server.registerTool('claude_start', {
   title: 'Start Claude with live card', description: `${startDescription} ${modelGuidance(catalog)}`,
   inputSchema: startShape,
@@ -213,6 +215,7 @@ const startTool = uiEnabled ? server.registerTool('claude_start', {
   _meta: cardMeta,
 }, async (input) => {
   const bad = (error: string) => ({ isError: true, content: [{ type: 'text' as const, text: error }], structuredContent: { error } });
+  if (input.background && !backgroundNotifications) return bad('Background completion notifications are disabled; start without background and call claude_wait.');
   if (Boolean(input.cwd) === Boolean(input.session_id)) return bad('Provide exactly one of cwd for a new session or session_id for a follow-up.');
   if (input.session_id && (input.permission_mode !== undefined || input.allowed_tools !== undefined)) {
     return bad('Follow-ups retain the session permission mode and allowed tools; do not pass them again.');
@@ -241,7 +244,7 @@ const startTool = uiEnabled ? server.registerTool('claude_start', {
 if (uiEnabled) {
 server.registerTool('claude_wait', {
   title: 'Wait for Claude',
-  description: 'For an interactive run started by claude_start, wait for and return the final Claude answer and session_id. For a background run call this after the completion message, or as fallback if no message arrives; the start response is not the answer. Cancelling this wait cancels the running Claude process. CLI and non-interactive sessions should use claude_ask or claude_followup instead.',
+  description: `For an interactive run started by claude_start, wait for and return the final Claude answer and session_id. This call stays open until the run completes; it is not a short status poll. If an asynchronous tool wrapper yields a pending call, wait on that same call using the longest permitted wait interval instead of repeatedly calling claude_wait or polling frequently. ${backgroundNotifications ? 'For a background run call this after the completion message, or as fallback if no message arrives. ' : ''}The start response is not the answer. Cancelling this wait cancels the running Claude process. The host may impose its own tool timeout. CLI and non-interactive sessions should use claude_ask or claude_followup instead.`,
   inputSchema: { run_id: z.string().uuid() },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 }, async ({ run_id }, extra) => {
@@ -274,7 +277,7 @@ server.registerTool('claude_run_status', {
   const run = interactiveRuns.get(run_id);
   if (!run) return { content: [{ type: 'text' as const, text: JSON.stringify({ available: false }) }], structuredContent: { available: false } };
   const liveData = readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset, stream_revision);
-  const notify = Boolean(liveData.available && claim_notification && run.input.background && run.result && !run.notificationClaimed && !run.waiters && !run.resultDelivered);
+  const notify = Boolean(backgroundNotifications && liveData.available && claim_notification && run.input.background && run.result && !run.notificationClaimed && !run.waiters && !run.resultDelivered);
   if (notify) run.notificationClaimed = true;
   const data = { ...liveData, background: Boolean(run.input.background), notification_claimed: notify,
     status: run.result ? (run.result.isError ? (run.controller.signal.aborted ? 'cancelled' : 'failed') : 'completed') : run.controller.signal.aborted ? 'cancelling' : 'working',

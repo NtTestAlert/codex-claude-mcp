@@ -20,6 +20,8 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   const log = path.join(temp, 'calls.jsonl');
   await fs.mkdir(project);
   await fs.mkdir(source);
+  await fs.mkdir(path.join(home, '.codex-claude-mcp'), { recursive: true });
+  await fs.writeFile(path.join(home, '.codex-claude-mcp', 'config.json'), JSON.stringify({ background_notifications: true }));
   const connections = new Set();
   t.after(async () => {
     for (const client of connections) await client.close();
@@ -67,6 +69,7 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   assert.match(client.getInstructions(), /interactive sessions with an MCP Apps card/i);
   assert.match(client.getInstructions(), /For CLI, non-interactive, or clients without MCP Apps use claude_ask or claude_followup directly/);
   const listed = await client.listTools();
+  assert.match(listed.tools.find(tool => tool.name === 'claude_wait').description, /wait on that same call using the longest permitted wait interval/);
   assert.deepEqual(listed.tools.map(tool => tool.name).sort(), ['claude_ask', 'claude_cancel', 'claude_followup', 'claude_get_quota', 'claude_list_models', 'claude_run_status', 'claude_start', 'claude_ui_probe', 'claude_ui_status', 'claude_wait']);
   const cardUri = 'ui://claude/inspector.html';
   for (const tool of listed.tools.filter(tool => ['claude_ask', 'claude_followup', 'claude_start', 'claude_ui_probe'].includes(tool.name))) {
@@ -270,9 +273,12 @@ test('MCP ask, follow-up, and restart preserve isolated conversation ownership',
   const unknownWait = await client.callTool({ name: 'claude_wait', arguments: { run_id: randomUUID() } });
   assert.equal(unknownWait.isError, true);
   const cancelStart = await call(client, 'claude_start', { prompt: '__hang_until_cancelled__', cwd: project });
+  const pendingWait = client.callTool({ name: 'claude_wait', arguments: { run_id: cancelStart.parsed.run_id } });
+  const early = await Promise.race([pendingWait.then(() => 'completed'), delay(500).then(() => 'pending')]);
+  assert.equal(early, 'pending');
   const cancelled = await call(client, 'claude_cancel', { run_id: cancelStart.parsed.run_id });
   assert.equal(cancelled.parsed.status, 'cancelling');
-  const cancelResult = await client.callTool({ name: 'claude_wait', arguments: { run_id: cancelStart.parsed.run_id } });
+  const cancelResult = await pendingWait;
   assert.equal(cancelResult.isError, true);
   const cancelledStatus = await call(client, 'claude_run_status', { run_id: cancelStart.parsed.run_id, offset: 0 });
   assert.equal(cancelledStatus.parsed.status, 'cancelled');
@@ -348,6 +354,12 @@ test('startup config controls UI tools, resources, and guidance', { timeout: 300
   assert.equal((await disabled.listTools()).tools.length, 4, 'config changes apply only on restart');
   const enabled = await connect();
   assert.match(enabled.getInstructions(), /claude_start.*claude_wait/);
+  assert.doesNotMatch(enabled.getInstructions(), /background=true/);
+  const backgroundDisabled = await enabled.callTool({ name: 'claude_start', arguments: { prompt: 'hello', cwd: temp, background: true } });
+  assert.equal(backgroundDisabled.isError, true);
+  assert.match(backgroundDisabled.structuredContent.error, /disabled/);
+  const enabledStart = (await enabled.listTools()).tools.find(tool => tool.name === 'claude_start');
+  assert.match(enabledStart.inputSchema.properties.background.description, /disabled/);
   assert.ok((await enabled.listTools()).tools.some(tool => tool.name === 'claude_start'));
   assert.ok((await enabled.listResources()).resources.some(resource => resource.uri === 'ui://claude/inspector.html'));
   for (const setting of [undefined, 'auto', 'true', 'false']) {
@@ -368,7 +380,7 @@ test('invalid startup config fails clearly instead of silently enabling UI', asy
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
   const configDir = path.join(temp, '.codex-claude-mcp');
   await fs.mkdir(configDir);
-  for (const contents of ['{', '{"ui_enabled":"sometimes"}', '{"ui_enabled":42}', '{"ui_enabled":null}', '{"model_refresh_sec":-1}', '{"model_refresh_sec":1.5}', '{"model_refresh_sec":"60"}']) {
+  for (const contents of ['{', '{"ui_enabled":"sometimes"}', '{"ui_enabled":42}', '{"ui_enabled":null}', '{"model_refresh_sec":-1}', '{"model_refresh_sec":1.5}', '{"model_refresh_sec":"60"}', '{"background_notifications":"true"}']) {
     await fs.writeFile(path.join(configDir, 'config.json'), contents);
     const child = spawnSync(process.execPath, [path.join(root, 'dist', 'index.js')], {
       cwd: root, env: { ...process.env, CLAUDE_BRIDGE_HOME: temp }, encoding: 'utf8', timeout: 5000, windowsHide: true,
