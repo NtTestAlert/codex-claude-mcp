@@ -203,7 +203,9 @@ the host controls whether cards are recreated and whether its own tool row
 collapses.
 
 During an interactive run, the card shows elapsed time, model, effort and a
-compact activity derived from Claude's events. When Claude does not report the
+compact activity derived from Claude's events. Separate text blocks appear on
+separate lines, and consecutive tool actions are grouped in the output with
+running and completed counts. When Claude does not report the
 model or effort, the card shows the requested setting or `default`; `default`
 does not identify the actual choice. A Cancel button is available for interactive
 runs when the host permits app tool calls. The JSON details remain available.

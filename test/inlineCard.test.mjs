@@ -13,16 +13,16 @@ function harness(host = {}) {
   let timerId = 0, disconnected = false;
   const elements = Object.fromEntries(['card', 'prompt', 'prompt-toggle', 'output', 'details', 'json', 'status', 'cost', 'request-cost', 'quota', 'run-info', 'cancel', 'notification'].map(id => {
     const handlers = new Map();
-    return [id, { textContent: '', open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
+    return [id, { textContent: '', children: [], open: id === 'card', hidden: false, scrollHeight: 100, clientHeight: 100, scrollTop: 0,
       classList: { toggle() {} }, addEventListener: (name, fn) => handlers.set(name, fn),
-      appendChild: node => { elements[id].textContent += node.textContent; }, trigger: name => handlers.get(name)?.() }];
+      appendChild: node => { elements[id].children.push(node); elements[id].textContent += node.textContent; }, trigger: name => handlers.get(name)?.() }];
   }));
   const parent = { postMessage: message => sent.push(message) };
   const window = { parent, openai: host.openai, addEventListener: (name, fn) => listeners.set(name, fn),
     removeEventListener: name => listeners.delete(name) };
   const script = cardHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
   vm.runInNewContext(script, { window,
-    document: { getElementById: id => elements[id], createTextNode: text => ({ textContent: text }),
+    document: { getElementById: id => elements[id], createTextNode: text => ({ textContent: text }), createElement: () => ({ textContent: '', className: '' }),
       body: { getBoundingClientRect: () => ({ height: 300 }) }, documentElement: { clientWidth: 400, style: {} } },
     setTimeout: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout: id => timers.delete(id),
@@ -311,6 +311,50 @@ test('live buffers isolate simultaneous runs, enforce bounds, and expire on clos
   assert.equal(readLiveRun(1, a, 0).truncated, true);
   first.close(); second.close();
   assert.equal(readLiveRun(1, a, 0).available, false);
+});
+
+test('stream groups adjacent actions and updates the existing row while preserving text blocks', () => {
+  const h = harness({ capabilities: { serverTools: {} } });
+  h.initialize();
+  h.receive({ method: 'ui/notifications/tool-input', params: { arguments: { prompt: 'hello' } } });
+  h.receive({ method: 'ui/notifications/tool-result', params: { structuredContent: { status: 'working', run_id: 'run-id' } } });
+  const actions = [{ id: 'a', kind: 'command', state: 'running' }, { id: 'b', kind: 'read', state: 'running' }];
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'working', text: 'first', next_offset: 5,
+    revision: 1, segments: [{ type: 'text', text: 'first' }, { type: 'actions', actions }] } } });
+  const nodes = h.elements.output.children;
+  assert.equal(nodes.length, 2);
+  assert.match(nodes[1].textContent, /Running a command.*Reading files/);
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'working', text: '\nsecond', next_offset: 12,
+    revision: 2, segments: [{ type: 'text', text: 'first' }, { type: 'actions', actions: actions.map(a => ({ ...a, state: 'done' })) }, { type: 'text', text: 'second' }] } } });
+  assert.equal(nodes.length, 3);
+  assert.match(nodes[1].textContent, /Ran 1 command.*Read 1 file operation/);
+  assert.equal(nodes[0].textContent, 'first');
+  assert.equal(nodes[2].textContent, 'second');
+  h.tick(700);
+  h.receive({ id: h.sent.at(-1).id, result: { structuredContent: { available: true, status: 'completed', text: '', next_offset: 12,
+    revision: 2, segments: [{ type: 'text', text: 'first' }, { type: 'actions', actions }, { type: 'text', text: 'second' }], result: { answer: 'final' } } } });
+  assert.equal(nodes[0].textContent, 'first');
+  assert.equal(nodes[2].textContent, 'final');
+});
+
+test('live run separates text blocks and groups consecutive actions', () => {
+  const identity = { prompt: 'blocks' }, run = startLiveRun('blocks', identity);
+  run.append('one', true); run.append(' continued', false);
+  run.actionStart('a', 'command'); run.actionEnd('a', false);
+  run.actionStart('b', 'read');
+  let state = readLiveRun('blocks', identity, 0);
+  assert.equal(state.segments.length, 2);
+  assert.equal(state.segments[1].actions[0].state, 'done');
+  assert.equal(state.segments[1].actions[1].state, 'running');
+  assert.equal(readLiveRun('blocks', identity, 0, state.revision).segments, undefined);
+  run.actionEnd('b', true); run.append('two', true);
+  state = readLiveRun('blocks', identity, 0);
+  assert.equal(state.text, 'one continued\ntwo');
+  assert.equal(state.segments[1].actions[1].state, 'failed');
+  assert.equal(state.segments[2].text, 'two');
+  run.close();
 });
 
 test('MCP client discovers card and app-only status; probe needs no Claude', async t => {

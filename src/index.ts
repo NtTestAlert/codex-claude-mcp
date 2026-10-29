@@ -117,6 +117,7 @@ async function invoke(input: Input, extra: Extra, live?: ReturnType<typeof start
         const run = await runClaude({ command, args, cwd: info.cwd, env, stdin: input.prompt,
           expectedSessionId: sessionId, outputFile: path.join(dir, 'answer.txt'), timeoutMs: remaining, signal,
           onTextDelta: live?.append,
+          onActionStart: live?.actionStart, onActionEnd: live?.actionEnd,
           onStatus: live?.update,
           onProgress: token === undefined ? undefined : ({ elapsedSec, lastEvent }) => {
             void extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token,
@@ -266,13 +267,13 @@ server.registerTool('claude_cancel', {
 });
 server.registerTool('claude_run_status', {
   title: 'Read interactive Claude output', description: 'Read incremental output and completion status for an interactive run. Used by the live card.',
-  inputSchema: { run_id: z.string().uuid(), offset: z.number().int().min(0), claim_notification: z.boolean().default(false) },
+  inputSchema: { run_id: z.string().uuid(), offset: z.number().int().min(0), stream_revision: z.number().int().min(0).optional(), claim_notification: z.boolean().default(false) },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   _meta: { ui: { visibility: ['app'] } },
-}, async ({ run_id, offset, claim_notification }) => {
+}, async ({ run_id, offset, stream_revision, claim_notification }) => {
   const run = interactiveRuns.get(run_id);
   if (!run) return { content: [{ type: 'text' as const, text: JSON.stringify({ available: false }) }], structuredContent: { available: false } };
-  const liveData = readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset);
+  const liveData = readLiveRun(run_id, { prompt: run.input.prompt, cwd: run.input.cwd, session_id: run.input.session_id }, offset, stream_revision);
   const notify = Boolean(liveData.available && claim_notification && run.input.background && run.result && !run.notificationClaimed && !run.waiters && !run.resultDelivered);
   if (notify) run.notificationClaimed = true;
   const data = { ...liveData, background: Boolean(run.input.background), notification_claimed: notify,

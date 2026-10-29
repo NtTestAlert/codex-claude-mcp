@@ -15,7 +15,9 @@ export interface RunOptions {
   expectedSessionId?: string;
   signal?: AbortSignal;
   onProgress?: (info: { elapsedSec: number; lastEvent?: string }) => void;
-  onTextDelta?: (text: string) => void;
+  onTextDelta?: (text: string, newBlock: boolean) => void;
+  onActionStart?: (id: string, kind: string) => void;
+  onActionEnd?: (id: string, failed: boolean) => void;
   onStatus?: (info: { phase?: string; model?: string }) => void;
 }
 
@@ -51,6 +53,8 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
   const warnings: string[] = [];
   const stderr: string[] = [];
   const tools = new Set<string>();
+  const streamedTools = new Set<string>();
+  let newTextBlock = true;
   const activity: RunResult['activity'] = { commands: 0, mcp_tool_calls: [], subagent_events: 0 };
   let sessionId: string | undefined;
   let answer = '';
@@ -84,16 +88,31 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
     try { o.onProgress({ elapsedSec: elapsedSec(), lastEvent }); } catch { /* advisory callback */ }
   };
   const status = (info: { phase?: string; model?: string }) => { try { o.onStatus?.(info); } catch { /* advisory callback */ } };
+  const actionStart = (block: Json) => {
+    const id = str(block.id), name = str(block.name);
+    if (!id || !name || streamedTools.has(id)) return;
+    streamedTools.add(id); newTextBlock = true;
+    const kind = name === 'Bash' || name === 'PowerShell' ? 'command'
+      : ['Read', 'Glob', 'Grep', 'LS'].includes(name) ? 'read'
+      : ['Edit', 'Write', 'NotebookEdit'].includes(name) ? 'edit'
+      : name === 'Agent' || name === 'Task' ? 'agent' : 'tool';
+    try { o.onActionStart?.(id, kind); } catch { /* advisory callback */ }
+  };
   const event = (ev: Json) => {
     lastEvent = str(ev.type) ?? 'unknown';
     if (ev.type === 'stream_event' && !ev.parent_tool_use_id && obj(ev.event)) {
-      if (ev.event.type === 'message_start') { partialAnswer = ''; status({ phase: 'Thinking' }); }
+      if (ev.event.type === 'message_start') { partialAnswer = ''; newTextBlock = true; status({ phase: 'Thinking' }); }
+      if (ev.event.type === 'content_block_start' && obj(ev.event.content_block)) {
+        if (ev.event.content_block.type === 'text') newTextBlock = true;
+        if (ev.event.content_block.type === 'tool_use') actionStart(ev.event.content_block);
+      }
       if (ev.event.type === 'content_block_delta' && obj(ev.event.delta) &&
           ev.event.delta.type === 'text_delta' && typeof ev.event.delta.text === 'string') {
         partialAnswer += ev.event.delta.text;
         answer = partialAnswer;
         status({ phase: 'Responding' });
-        try { o.onTextDelta?.(ev.event.delta.text); } catch { /* advisory callback */ }
+        try { o.onTextDelta?.(ev.event.delta.text, newTextBlock); } catch { /* advisory callback */ }
+        newTextBlock = false;
       }
     }
     if (ev.type === 'system' && ev.subtype === 'init') {
@@ -141,6 +160,7 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
         if (!obj(block)) continue;
         if (block.type === 'text' && typeof block.text === 'string') text.push(block.text);
         if (block.type === 'tool_use') {
+          if (!ev.parent_tool_use_id) actionStart(block);
           const name = str(block.name) ?? 'unknown';
           const id = str(block.id);
           if (id && tools.has(id)) continue;
@@ -161,8 +181,15 @@ export async function runClaude(o: RunOptions): Promise<RunResult> {
       if (text.length && !ev.parent_tool_use_id) answer = text.join('\n');
       if (ev.error) failure = message(ev.error);
     }
-    if (ev.type === 'user' && !ev.parent_tool_use_id && obj(ev.message) && Array.isArray(ev.message.content) &&
-        ev.message.content.some(block => obj(block) && block.type === 'tool_result')) status({ phase: 'Thinking' });
+    if (ev.type === 'user' && !ev.parent_tool_use_id && obj(ev.message) && Array.isArray(ev.message.content)) {
+      let completed = false;
+      for (const block of ev.message.content) if (obj(block) && block.type === 'tool_result') {
+        completed = true;
+        const id = str(block.tool_use_id);
+        if (id) try { o.onActionEnd?.(id, block.is_error === true); } catch { /* advisory callback */ }
+      }
+      if (completed) status({ phase: 'Thinking' });
+    }
     if (ev.type === 'result') {
       resultSeen = true;
       if (typeof ev.total_cost_usd === 'number' && Number.isFinite(ev.total_cost_usd) && ev.total_cost_usd >= 0) totalCostUsd = ev.total_cost_usd;

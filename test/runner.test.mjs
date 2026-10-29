@@ -103,6 +103,22 @@ test('reports parent activity and the model from Claude events', async t => {
   assert.deepEqual(status, [{ phase: 'Thinking', model: 'actual-model' }, { phase: 'Reading files' },
     { phase: 'Running a command' }, { phase: 'Thinking' }, { phase: 'Responding' }]);
 });
+test('reports text block boundaries and deduplicates streamed tool starts', async t => {
+  const events = [];
+  const start = block => ({ type: 'stream_event', event: { type: 'content_block_start', content_block: block } });
+  const delta = text => ({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  const tool = { type: 'tool_use', id: 'a', name: 'Bash' };
+  await run(t, [init, start({ type: 'text' }), delta('first'), delta(' chunk'), start(tool),
+    { type: 'assistant', message: { content: [tool] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'a' }] } },
+    start({ type: 'text' }), delta('second'), result('second')], {}, {
+    onTextDelta(text, newBlock) { events.push(['text', text, newBlock]); },
+    onActionStart(id, kind) { events.push(['start', id, kind]); },
+    onActionEnd(id, failed) { events.push(['end', id, failed]); },
+  });
+  assert.deepEqual(events, [['text', 'first', true], ['text', ' chunk', false], ['start', 'a', 'command'],
+    ['end', 'a', false], ['text', 'second', true]]);
+});
 test('tracks tool calls once and ignores subagent answer text', async t => {
   const tool = { type: 'assistant', message: { content: [
     { type: 'tool_use', id: 'a', name: 'Bash' }, { type: 'tool_use', id: 'b', name: 'mcp__example__lookup' },

@@ -29,6 +29,8 @@ export const cardHtml = String.raw`<!doctype html>
     button { background: none; border: 0; color: inherit; padding: 2px 0; text-decoration: underline; font: inherit; }
     button:focus-visible, summary:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
     .output { height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px; background: var(--color-background-secondary, ButtonFace); border-radius: 5px; }
+    .stream-entry + .stream-entry { margin-top: 8px; }
+    .stream-actions { color: var(--color-text-secondary, GrayText); font-size: 12px; }
     .details { margin-top: 10px; }
     .cost { float: right; color: var(--color-text-secondary, GrayText); font-weight: 400; font-variant-numeric: tabular-nums; }
     .request-cost { opacity: 0.7; margin-right: 8px; }
@@ -63,6 +65,7 @@ export const cardHtml = String.raw`<!doctype html>
       let canNotify = false, backgroundMode = false;
       let promptExpanded = false, haveOutput = false, restoredScrollTop, widgetTimer, missingPolls = 0;
       let lastModel, lastEffort;
+      let streamRevision = -1, streamNodes = [], streamSegments;
       const send = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
       const format = value => JSON.stringify(value, null, 2);
       const showCost = result => {
@@ -168,6 +171,54 @@ export const cardHtml = String.raw`<!doctype html>
           output.scrollTop = restoredScrollTop; restoredScrollTop = undefined;
         }
       };
+      const actionSummary = actions => {
+        const labels = { command: ['command', 'commands', 'Running a command', 'Ran'], read: ['file operation', 'file operations', 'Reading files', 'Read'],
+          edit: ['edit', 'edits', 'Editing files', 'Made'], agent: ['agent', 'agents', 'Working with an agent', 'Used'], tool: ['tool', 'tools', 'Using a tool', 'Used'] };
+        const parts = [];
+        for (const kind of Object.keys(labels)) {
+          const list = actions.filter(action => action.kind === kind), names = labels[kind];
+          const done = list.filter(action => action.state === 'done').length;
+          const failed = list.filter(action => action.state === 'failed').length;
+          const stopped = list.filter(action => action.state === 'stopped').length;
+          const active = list.filter(action => action.state === 'running').length;
+          if (done) parts.push(names[3] + ' ' + done + ' ' + (done === 1 ? names[0] : names[1]));
+          if (failed) parts.push(failed + ' failed ' + (failed === 1 ? names[0] : names[1]));
+          if (stopped) parts.push(stopped + ' unfinished ' + (stopped === 1 ? names[0] : names[1]));
+          if (active) parts.push(active === 1 ? names[2] : names[2] + ' (' + active + ')');
+        }
+        return parts.join(' · ');
+      };
+      const renderStream = data => {
+        if (!Array.isArray(data?.segments) || !Number.isSafeInteger(data.revision) || data.revision === streamRevision) return false;
+        streamRevision = data.revision; streamSegments = data.segments;
+        if (!data.segments.length && !streamNodes.length) return false;
+        if (!streamNodes.length) { output.textContent = ''; haveOutput = true; }
+        data.segments.forEach((segment, index) => {
+          let node = streamNodes[index];
+          if (!node) { node = document.createElement('div'); node.className = 'stream-entry' + (segment.type === 'actions' ? ' stream-actions' : '');
+            streamNodes.push(node); output.appendChild(node); }
+          const value = segment.type === 'text' ? segment.text : actionSummary(Array.isArray(segment.actions) ? segment.actions : []);
+          if (node.textContent !== value) node.textContent = value;
+        });
+        if (follow) output.scrollTop = output.scrollHeight;
+        else if (restoredScrollTop !== undefined && (finished || output.scrollHeight - output.clientHeight >= restoredScrollTop)) {
+          output.scrollTop = restoredScrollTop; restoredScrollTop = undefined;
+        }
+        return true;
+      };
+      const finishOutput = result => {
+        const answer = typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output');
+        if (!streamNodes.length) { setOutput(answer, false); return; }
+        streamSegments?.forEach((segment, index) => {
+          if (segment.type === 'actions' && segment.actions?.some(action => action.state === 'running')) {
+            streamNodes[index].textContent = actionSummary(segment.actions.map(action => action.state === 'running' ? { ...action, state: 'stopped' } : action));
+          }
+        });
+        const last = streamSegments?.at(-1);
+        if (last?.type === 'text') streamNodes[streamNodes.length - 1].textContent = answer;
+        else { const node = document.createElement('div'); node.className = 'stream-entry'; node.textContent = answer; output.appendChild(node); streamNodes.push(node); }
+        if (follow) output.scrollTop = output.scrollHeight;
+      };
       promptToggle.addEventListener('click', () => { promptExpanded = !promptExpanded; showPrompt(input?.prompt); save(); resize(); });
       output.addEventListener('scroll', () => { follow = output.scrollHeight - output.scrollTop - output.clientHeight < 24; save(); });
       detail.addEventListener('toggle', () => { save(); resize(); });
@@ -187,9 +238,10 @@ export const cardHtml = String.raw`<!doctype html>
       const poll = () => {
         if (!polling || finished || !input || (runId === undefined && callId === undefined)) return;
         pollRequest = 'claude-live-' + (++requestSeq);
-        const args = runId !== undefined ? { run_id: runId, offset, ...(backgroundMode && canNotify ? { claim_notification: true } : {}) } : {
+        const revision = streamRevision < 0 ? {} : { stream_revision: streamRevision };
+        const args = runId !== undefined ? { run_id: runId, offset, ...revision, ...(backgroundMode && canNotify ? { claim_notification: true } : {}) } : {
           request_id: callId, prompt: input.prompt, ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
-          ...(input.session_id === undefined ? {} : { session_id: input.session_id }), offset,
+          ...(input.session_id === undefined ? {} : { session_id: input.session_id }), offset, ...revision,
         };
         send({ id: pollRequest, method: 'tools/call', params: { name: runId !== undefined ? 'claude_run_status' : 'claude_ui_status', arguments: args } });
         timer = setTimeout(() => { if (pollRequest) { stopPolling(); status.textContent = 'Running · live output unavailable';
@@ -254,7 +306,8 @@ export const cardHtml = String.raw`<!doctype html>
           if (data?.available) {
             missingPolls = 0;
             showRunInfo(data);
-            if (typeof data.text === 'string' && data.text) setOutput(data.text, true);
+            renderStream(data);
+            if (!Number.isSafeInteger(data.revision) && typeof data.text === 'string' && data.text) setOutput(data.text, true);
             if (Number.isSafeInteger(data.next_offset) && data.next_offset >= offset) offset = data.next_offset;
             if (data.truncated) status.textContent = 'Running · live output truncated';
             if (data.status === 'cancelling') status.textContent = 'Cancelling';
@@ -265,7 +318,7 @@ export const cardHtml = String.raw`<!doctype html>
               json.textContent = format({ input, result });
               showCost(result);
               requestQuota();
-              setOutput(typeof result.answer === 'string' && result.answer ? result.answer : (result.error || 'No output'), false);
+              finishOutput(result);
               status.textContent = data.status === 'cancelled' ? 'Cancelled' : data.status === 'failed' ? 'Failed' : 'Complete';
               if (data.notification_claimed && runId && canNotify) notifyCompletion(runId, data.status);
               else if (data.background) showNotification('Completion notification unavailable or already attempted; use claude_wait if needed.');
@@ -295,7 +348,7 @@ export const cardHtml = String.raw`<!doctype html>
             }
             if (typeof result?.run_id === 'string' && result.status === 'working') {
               if (finished || runId === result.run_id) break;
-              stopPolling(); runId = result.run_id; offset = 0;
+              stopPolling(); runId = result.run_id; offset = 0; streamRevision = -1;
               backgroundMode = result.background === true || input?.background === true;
               json.textContent = format({ input, start: result });
               polling = canCallTools;
@@ -312,7 +365,7 @@ export const cardHtml = String.raw`<!doctype html>
             showCost(result);
             requestQuota();
             const failed = params.isError || result?.error;
-            setOutput(typeof result?.answer === 'string' && result.answer ? result.answer : (result?.error || 'No output'), false);
+            finishOutput(result ?? {});
             status.textContent = failed ? 'Failed' : 'Complete';
             save(); break;
           }
@@ -350,11 +403,11 @@ export function registerInlineCard(server: McpServer) {
     title: 'Read live Claude output',
     description: 'Read the next live text chunk for the matching active tool call. Used by the Claude inline card.',
     inputSchema: { request_id: z.union([z.string(), z.number()]), prompt: z.string(), cwd: z.string().optional(),
-      session_id: z.string().optional(), offset: z.number().int().min(0) },
+      session_id: z.string().optional(), offset: z.number().int().min(0), stream_revision: z.number().int().min(0).optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { visibility: ['app'] } },
-  }, async ({ request_id, prompt, cwd, session_id, offset }) => {
-    const data = readLiveRun(request_id, { prompt, cwd, session_id }, offset);
+  }, async ({ request_id, prompt, cwd, session_id, offset, stream_revision }) => {
+    const data = readLiveRun(request_id, { prompt, cwd, session_id }, offset, stream_revision);
     return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
   });
   server.registerTool('claude_ui_probe', {
